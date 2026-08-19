@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 
 from app.schemas.prediction import PredictionRequest, PredictionResponse
+from app.security.api_key import verify_api_key
 from app.services.model_service import model_service
+
 
 app = FastAPI(
     title="P8 Credit Scoring API",
@@ -34,13 +36,22 @@ def model_info():
         "loaded": model_service.loaded,
     }
 
-@app.post("/predict", response_model=PredictionResponse)
+
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 def predict(request: PredictionRequest):
     try:
-        probability_default = model_service.predict_proba(request.features)
+        probability_default = model_service.predict_proba(
+            request.features
+        )
 
         threshold = 0.45
-        prediction = int(probability_default >= threshold)
+        prediction = int(
+            probability_default >= threshold
+        )
 
         return {
             "probability_default": probability_default,
@@ -57,10 +68,13 @@ def predict(request: PredictionRequest):
         raise HTTPException(
             status_code=422,
             detail=str(error),
-        )
+        ) from error
 
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Erreur interne lors de la prédiction : {error}",
-        )
+            detail=(
+                "Erreur interne lors de la prédiction : "
+                f"{error}"
+            ),
+        ) from error

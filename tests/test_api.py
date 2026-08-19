@@ -1,8 +1,14 @@
+import os
+
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.model_service import model_service
 
+
+TEST_API_KEY = "test-secret-key"
+
+os.environ["API_KEY"] = TEST_API_KEY
 
 client = TestClient(app)
 
@@ -15,6 +21,12 @@ def build_valid_payload():
 
     return {
         "features": features
+    }
+
+
+def auth_headers():
+    return {
+        "X-API-Key": TEST_API_KEY
     }
 
 
@@ -45,10 +57,32 @@ def test_model_info():
     assert data["n_features"] == 656
 
 
+def test_predict_without_api_key():
+    response = client.post(
+        "/predict",
+        json=build_valid_payload(),
+    )
+
+    assert response.status_code == 401
+
+
+def test_predict_with_invalid_api_key():
+    response = client.post(
+        "/predict",
+        json=build_valid_payload(),
+        headers={
+            "X-API-Key": "wrong-key"
+        },
+    )
+
+    assert response.status_code == 401
+
+
 def test_predict_valid_payload():
     response = client.post(
         "/predict",
         json=build_valid_payload(),
+        headers=auth_headers(),
     )
 
     assert response.status_code == 200
@@ -73,6 +107,7 @@ def test_predict_missing_feature():
     response = client.post(
         "/predict",
         json=payload,
+        headers=auth_headers(),
     )
 
     assert response.status_code == 422
@@ -86,6 +121,7 @@ def test_predict_extra_feature():
     response = client.post(
         "/predict",
         json=payload,
+        headers=auth_headers(),
     )
 
     assert response.status_code == 422
@@ -100,6 +136,7 @@ def test_predict_invalid_type():
     response = client.post(
         "/predict",
         json=payload,
+        headers=auth_headers(),
     )
 
     assert response.status_code == 422
