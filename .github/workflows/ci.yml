@@ -1,0 +1,32 @@
+name: CI - Tests API
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  tests:
+    name: Tests Pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Installer les dependances
+        run: uv sync --frozen
+
+      - name: Executer les tests
+        run: uv run pytest -v

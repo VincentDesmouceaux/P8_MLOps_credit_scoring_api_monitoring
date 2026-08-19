@@ -1,0 +1,22 @@
+artifact_path: /Users/vincentdesmouceaux/dev/P6_MLOps_credit_scoring/mlruns/3/models/m-1f59b9bef15844b7913f261b5c4853ec/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.12.12
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.sklearn.XGBClassifier
+    model_format: ubj
+    xgb_version: 3.3.0
+mlflow_version: 3.14.0
+model_id: m-1f59b9bef15844b7913f261b5c4853ec
+model_size_bytes: 707287
+model_uuid: m-1f59b9bef15844b7913f261b5c4853ec
+prompts: null
+run_id: 5cd584a85f1d4eecaa012636815f3f24
+utc_time_created: '2026-06-30 06:04:34.509875'

@@ -2,4 +2,22 @@
 name = "p8-mlops-credit-scoring-api-monitoring"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.141.1",
+    "mlflow==3.14.0",
+    "numpy==2.5.0",
+    "pandas==2.3.3",
+    "uvicorn>=0.52.4",
+    "xgboost==3.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "httpx2>=2.12.0",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
