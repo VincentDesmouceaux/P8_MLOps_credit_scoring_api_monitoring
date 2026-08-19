@@ -1,4 +1,4 @@
-name: CI - Tests API et Build Docker
+name: CI/CD - Tests, Build Docker et Deploy Render
 
 on:
   push:
@@ -49,3 +49,17 @@ jobs:
           context: .
           push: false
           tags: p8-credit-scoring-api:latest
+
+  deploy:
+    name: Deploy Render
+    runs-on: ubuntu-latest
+    needs: build-docker
+
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Declencher le deploiement Render
+        run: |
+          curl --fail --show-error --silent \
+            --request POST \
+            "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
