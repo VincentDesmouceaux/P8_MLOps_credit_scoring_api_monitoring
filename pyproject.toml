@@ -1,0 +1,5 @@
+[project]
+name = "p8-mlops-credit-scoring-api-monitoring"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
