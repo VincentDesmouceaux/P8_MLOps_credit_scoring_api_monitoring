@@ -68,6 +68,44 @@ def model_info():
     }
 
 
+def log_prediction_safely(
+    *,
+    request_id,
+    input_features,
+    probability_default,
+    prediction,
+    prediction_label,
+    threshold,
+    latency_ms,
+    status_code,
+    error_message,
+):
+    """
+    Enregistre les données de monitoring sans interrompre l'API
+    si le stockage PostgreSQL/Supabase est indisponible.
+    """
+    try:
+        save_prediction_log(
+            request_id=request_id,
+            input_features=input_features,
+            probability_default=probability_default,
+            prediction=prediction,
+            prediction_label=prediction_label,
+            threshold=threshold,
+            latency_ms=latency_ms,
+            status_code=status_code,
+            error_message=error_message,
+            model_name=MODEL_NAME,
+            model_version=MODEL_VERSION,
+        )
+
+    except Exception as log_error:
+        print(
+            f"Erreur de monitoring pour la requête "
+            f"{request_id}: {log_error}"
+        )
+
+
 @app.post(
     "/predict",
     response_model=PredictionResponse,
@@ -101,26 +139,17 @@ def predict(request: PredictionRequest):
             time.perf_counter() - start_time
         ) * 1000
 
-        try:
-            save_prediction_log(
-                request_id=request_id,
-                input_features=request.features,
-                probability_default=probability_default,
-                prediction=prediction,
-                prediction_label=prediction_label,
-                threshold=DECISION_THRESHOLD,
-                latency_ms=latency_ms,
-                status_code=200,
-                error_message=None,
-                model_name=MODEL_NAME,
-                model_version=MODEL_VERSION,
-            )
-
-        except Exception as log_error:
-            print(
-                f"Erreur de monitoring pour la requête "
-                f"{request_id}: {log_error}"
-            )
+        log_prediction_safely(
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=probability_default,
+            prediction=prediction,
+            prediction_label=prediction_label,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=200,
+            error_message=None,
+        )
 
         return {
             "probability_default": probability_default,
@@ -130,16 +159,50 @@ def predict(request: PredictionRequest):
         }
 
     except ValueError as error:
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        log_prediction_safely(
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=None,
+            prediction=None,
+            prediction_label=None,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=422,
+            error_message=str(error),
+        )
+
         raise HTTPException(
             status_code=422,
             detail=str(error),
         ) from error
 
     except Exception as error:
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        error_message = (
+            "Erreur interne lors de la prédiction : "
+            f"{error}"
+        )
+
+        log_prediction_safely(
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=None,
+            prediction=None,
+            prediction_label=None,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=500,
+            error_message=error_message,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Erreur interne lors de la prédiction : "
-                f"{error}"
-            ),
+            detail=error_message,
         ) from error
