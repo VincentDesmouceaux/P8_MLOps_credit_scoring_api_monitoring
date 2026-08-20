@@ -4,7 +4,6 @@ from typing import Any
 
 import mlflow.xgboost
 import numpy as np
-import pandas as pd
 
 
 # -------------------------------------------------------------------
@@ -25,6 +24,8 @@ FEATURE_NAMES_PATH = (
     / "feature_names.json"
 )
 
+EXPECTED_FEATURE_COUNT = 656
+
 
 # -------------------------------------------------------------------
 # Service modèle
@@ -33,6 +34,7 @@ FEATURE_NAMES_PATH = (
 class ModelService:
     def __init__(self) -> None:
         self.model: Any | None = None
+        self.booster: Any | None = None
         self.loaded = False
 
         if not FEATURE_NAMES_PATH.exists():
@@ -46,9 +48,7 @@ class ModelService:
             "r",
             encoding="utf-8",
         ) as file:
-            self.feature_names = json.load(
-                file
-            )
+            self.feature_names = json.load(file)
 
         if not isinstance(
             self.feature_names,
@@ -59,11 +59,11 @@ class ModelService:
                 "une liste de noms de features."
             )
 
-        if len(self.feature_names) != 656:
+        if len(self.feature_names) != EXPECTED_FEATURE_COUNT:
             raise RuntimeError(
                 "Le modèle P8 doit utiliser exactement "
-                f"656 features. Reçu : "
-                f"{len(self.feature_names)}."
+                f"{EXPECTED_FEATURE_COUNT} features. "
+                f"Reçu : {len(self.feature_names)}."
             )
 
         if len(
@@ -84,8 +84,9 @@ class ModelService:
         """
         Charge le modèle MLflow/XGBoost une seule fois.
 
-        Le modèle reste ensuite en mémoire et est réutilisé
-        pour toutes les prédictions.
+        Le Booster natif XGBoost est extrait au chargement
+        afin d'éviter les transformations pandas coûteuses
+        lors de chaque prédiction.
         """
         if self.loaded:
             return
@@ -109,10 +110,29 @@ class ModelService:
                 "Le chargement du modèle a échoué."
             )
 
+        try:
+            self.booster = self.model.get_booster()
+
+        except AttributeError as error:
+            raise RuntimeError(
+                "Impossible d'extraire le Booster XGBoost "
+                "du modèle chargé."
+            ) from error
+
+        if self.booster is None:
+            raise RuntimeError(
+                "Le Booster XGBoost n'est pas disponible."
+            )
+
         self.loaded = True
 
         print(
             "Modèle chargé."
+        )
+
+        print(
+            "Pipeline d'inférence : NumPy + "
+            "XGBoost Booster.inplace_predict"
         )
 
         print(
@@ -150,33 +170,39 @@ class ModelService:
         }
 
     # ----------------------------------------------------------------
-    # Construction du DataFrame d'inférence
+    # Construction du tableau NumPy
     # ----------------------------------------------------------------
 
-    def build_input_dataframe(
+    def build_input_array(
         self,
         features: dict[str, float | None],
-    ) -> pd.DataFrame:
+    ) -> np.ndarray:
         """
         Reconstruit une observation dans l'ordre exact
         des 656 features utilisées lors de l'entraînement.
 
-        Les valeurs JSON null deviennent None dans FastAPI,
-        puis np.nan ici afin de préserver les données
-        manquantes originales pour XGBoost.
-        """
-        values = []
+        Les valeurs JSON null deviennent None dans FastAPI
+        puis np.nan ici afin de préserver les valeurs manquantes
+        pour XGBoost.
 
-        for feature_name in self.feature_names:
+        Le tableau est construit directement en float32 afin
+        d'éviter le coût de création et de transformation
+        d'un DataFrame pandas.
+        """
+        values = np.empty(
+            EXPECTED_FEATURE_COUNT,
+            dtype=np.float32,
+        )
+
+        for index, feature_name in enumerate(
+            self.feature_names
+        ):
             value = features[
                 feature_name
             ]
 
             if value is None:
-                values.append(
-                    np.nan
-                )
-
+                values[index] = np.nan
                 continue
 
             try:
@@ -201,40 +227,26 @@ class ModelService:
                     f"'{feature_name}'."
                 )
 
-            values.append(
-                numeric_value
-            )
+            values[index] = numeric_value
 
-        input_df = pd.DataFrame(
-            [
-                values,
-            ],
-            columns=self.feature_names,
-            dtype=float,
+        input_array = values.reshape(
+            1,
+            -1,
         )
 
-        if input_df.shape != (
+        if input_array.shape != (
             1,
-            len(self.feature_names),
+            EXPECTED_FEATURE_COUNT,
         ):
             raise RuntimeError(
-                "Le DataFrame d'inférence n'a pas "
+                "Le tableau NumPy d'inférence n'a pas "
                 "la forme attendue."
             )
 
-        if (
-            input_df.columns.tolist()
-            != self.feature_names
-        ):
-            raise RuntimeError(
-                "L'ordre des features d'inférence "
-                "ne correspond pas au modèle."
-            )
-
-        return input_df
+        return input_array
 
     # ----------------------------------------------------------------
-    # Prédiction
+    # Prédiction optimisée
     # ----------------------------------------------------------------
 
     def predict_proba(
@@ -243,6 +255,13 @@ class ModelService:
     ) -> float:
         """
         Retourne la probabilité de défaut du client.
+
+        Pipeline optimisé :
+        dict -> NumPy float32 -> Booster.inplace_predict.
+
+        Cette approche évite les transformations pandas
+        identifiées comme principal goulot d'étranglement
+        lors du profiling cProfile.
         """
         self.load()
 
@@ -272,30 +291,36 @@ class ModelService:
                 f"Exemples : {extra_features[:5]}"
             )
 
-        input_df = self.build_input_dataframe(
+        input_array = self.build_input_array(
             features
         )
 
-        if self.model is None:
+        if self.booster is None:
             raise RuntimeError(
-                "Le modèle n'est pas chargé."
+                "Le Booster XGBoost n'est pas chargé."
             )
 
-        probabilities = self.model.predict_proba(
-            input_df
+        predictions = self.booster.inplace_predict(
+            input_array
         )
 
-        if (
-            len(probabilities) != 1
-            or len(probabilities[0]) < 2
-        ):
+        if len(predictions) != 1:
             raise RuntimeError(
-                "Format inattendu retourné par predict_proba()."
+                "Format inattendu retourné par "
+                "Booster.inplace_predict()."
             )
 
         probability_default = float(
-            probabilities[0][1]
+            predictions[0]
         )
+
+        if not np.isfinite(
+            probability_default
+        ):
+            raise RuntimeError(
+                "La probabilité retournée par le modèle "
+                "n'est pas finie."
+            )
 
         if not 0.0 <= probability_default <= 1.0:
             raise RuntimeError(

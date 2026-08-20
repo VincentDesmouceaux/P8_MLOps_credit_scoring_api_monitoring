@@ -1,0 +1,48 @@
+         11590166 function calls (11456962 primitive calls) in 2.848 seconds
+
+   Ordered by: cumulative time
+   List reduced from 334 to 40 due to restriction <40>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      100    0.000    0.000    2.818    0.028 model_service.py:240(predict_proba)
+      100    0.000    0.000    2.170    0.022 sklearn.py:1870(predict_proba)
+  200/100    0.005    0.000    2.169    0.022 core.py:534(inner_f)
+      100    0.000    0.000    2.169    0.022 sklearn.py:1402(predict)
+      100    0.114    0.001    2.160    0.022 core.py:2540(inplace_predict)
+      100    0.000    0.000    1.938    0.019 data.py:651(_transform_pandas_df)
+      100    0.081    0.001    1.535    0.015 data.py:534(pandas_transform_data)
+    65600    0.073    0.000    1.051    0.000 frame.py:4073(__getitem__)
+    65600    0.058    0.000    0.896    0.000 frame.py:4637(_get_item_cache)
+    65600    0.042    0.000    0.784    0.000 frame.py:3994(_ixs)
+      100    0.027    0.000    0.578    0.006 model_service.py:156(build_input_dataframe)
+      100    0.001    0.000    0.547    0.005 frame.py:698(__init__)
+    65600    0.039    0.000    0.531    0.000 frame.py:4619(_box_col_values)
+      100    0.000    0.000    0.398    0.004 construction.py:96(arrays_to_mgr)
+      100    0.036    0.000    0.368    0.004 construction.py:596(_homogenize)
+    65600    0.027    0.000    0.306    0.000 frame.py:682(_constructor_sliced_from_mgr)
+    66100    0.089    0.000    0.270    0.000 construction.py:517(sanitize_array)
+   262700    0.253    0.000    0.254    0.000 generic.py:6323(__setattr__)
+    65600    0.046    0.000    0.248    0.000 data.py:558(oth_type)
+      100    0.052    0.001    0.241    0.002 data.py:370(pandas_feature_info)
+  1990404    0.124    0.000    0.176    0.000 {built-in method builtins.isinstance}
+      100    0.028    0.000    0.160    0.002 data.py:607(__init__)
+      100    0.000    0.000    0.140    0.001 construction.py:506(nested_data_to_arrays)
+      100    0.000    0.000    0.139    0.001 construction.py:793(to_arrays)
+      100    0.004    0.000    0.139    0.001 construction.py:928(_finalize_columns_and_data)
+      100    0.006    0.000    0.135    0.001 construction.py:1006(convert_object_array)
+    65600    0.081    0.000    0.129    0.000 construction.py:1028(convert)
+    65600    0.090    0.000    0.126    0.000 managers.py:1031(iget)
+    65600    0.045    0.000    0.116    0.000 _data_utils.py:424(array_interface_dict)
+    65800    0.033    0.000    0.105    0.000 _dtype.py:342(_name_get)
+    65700    0.071    0.000    0.105    0.000 generic.py:6258(__finalize__)
+    65600    0.046    0.000    0.096    0.000 base.py:545(to_numpy)
+   131200    0.083    0.000    0.096    0.000 base.py:5385(__getitem__)
+    65600    0.019    0.000    0.082    0.000 generic.py:342(_from_mgr)
+      100    0.069    0.001    0.069    0.001 model_service.py:127(validate_features)
+   131200    0.018    0.000    0.067    0.000 series.py:710(dtype)
+    65800    0.015    0.000    0.065    0.000 _dtype.py:326(_name_includes_bit_suffix)
+   263200    0.061    0.000    0.061    0.000 typing.py:2187(cast)
+      100    0.001    0.000    0.061    0.001 core.py:3231(_validate_features)
+      200    0.000    0.000    0.060    0.000 core.py:2107(feature_names)
+
+

@@ -8,6 +8,7 @@ dependencies = [
     "mlflow==3.14.0",
     "numpy==2.5.0",
     "pandas==2.3.3",
+    "psutil>=7.2.2",
     "psycopg[binary]>=3.3.4",
     "python-dotenv>=1.2.3",
     "sqlalchemy>=2.0.52",
