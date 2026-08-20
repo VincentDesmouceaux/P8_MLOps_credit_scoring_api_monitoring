@@ -7,6 +7,7 @@ dependencies = [
     "mlflow==3.14.0",
     "numpy==2.5.0",
     "pandas==2.3.3",
+    "psycopg[binary]>=3.3.4",
     "uvicorn>=0.52.4",
     "xgboost==3.3.0",
 ]
