@@ -3,11 +3,15 @@ name = "p8-mlops-credit-scoring-api-monitoring"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "evidently>=0.7.21",
     "fastapi>=0.141.1",
     "mlflow==3.14.0",
     "numpy==2.5.0",
     "pandas==2.3.3",
     "psycopg[binary]>=3.3.4",
+    "python-dotenv>=1.2.3",
+    "sqlalchemy>=2.0.52",
+    "streamlit>=1.62.0",
     "uvicorn>=0.52.4",
     "xgboost==3.3.0",
 ]

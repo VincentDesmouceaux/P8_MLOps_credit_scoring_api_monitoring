@@ -1,7 +1,9 @@
+import json
 import os
 import time
 from contextlib import asynccontextmanager
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
 
@@ -11,78 +13,186 @@ from app.security.api_key import verify_api_key
 from app.services.model_service import model_service
 
 
+# -------------------------------------------------------------------
+# Configuration API
+# -------------------------------------------------------------------
+
+API_TITLE = "P8 Credit Scoring API"
+API_VERSION = "0.2.0"
+API_SERVICE_NAME = "p8-credit-scoring-api"
+
+
+# -------------------------------------------------------------------
+# Configuration modèle
+# -------------------------------------------------------------------
+
 MODEL_NAME = "P6_credit_scoring_default_risk_model"
 MODEL_VERSION = "2"
+MODEL_FAMILY = "XGBoost"
+MLFLOW_ALIAS = "champion"
+
 DECISION_THRESHOLD = 0.45
 
+
+# -------------------------------------------------------------------
+# Cycle de vie FastAPI
+# -------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Charge le modèle une seule fois au démarrage de l'API.
+    Charge le modèle XGBoost une seule fois au démarrage.
 
-    Le même modèle reste ensuite en mémoire et est réutilisé
+    Le modèle reste ensuite en mémoire et est réutilisé
     pour toutes les requêtes de prédiction.
     """
     model_service.load()
+
     yield
 
 
 app = FastAPI(
-    title="P8 Credit Scoring API",
+    title=API_TITLE,
     description=(
         "API de mise en production du modèle de scoring crédit "
         "issu du projet P6."
     ),
-    version="0.2.0",
+    version=API_VERSION,
     lifespan=lifespan,
 )
 
 
+# -------------------------------------------------------------------
+# Endpoints techniques
+# -------------------------------------------------------------------
+
 @app.get("/health")
-def health_check():
+def health_check() -> dict[str, str]:
     """
     Vérifie que l'API est disponible.
     """
     return {
         "status": "ok",
-        "service": "p8-credit-scoring-api",
-        "version": "0.2.0",
+        "service": API_SERVICE_NAME,
+        "version": API_VERSION,
     }
 
 
 @app.get("/model-info")
-def model_info():
+def model_info() -> dict[str, Any]:
     """
-    Retourne les informations principales du modèle déployé.
+    Retourne les principales informations du modèle déployé.
     """
     return {
         "model_name": MODEL_NAME,
-        "model_version": 2,
-        "model_family": "XGBoost",
-        "mlflow_alias": "champion",
+        "model_version": int(MODEL_VERSION),
+        "model_family": MODEL_FAMILY,
+        "mlflow_alias": MLFLOW_ALIAS,
         "decision_threshold": DECISION_THRESHOLD,
         "n_features": len(model_service.feature_names),
         "loaded": model_service.loaded,
-        "deploy_commit": os.getenv("RENDER_GIT_COMMIT", "local"),
+        "deploy_commit": os.getenv(
+            "RENDER_GIT_COMMIT",
+            "local",
+        ),
     }
+
+
+# -------------------------------------------------------------------
+# Utilitaires monitoring
+# -------------------------------------------------------------------
+
+def compute_latency_ms(
+    start_time: float,
+) -> float:
+    """
+    Calcule le temps écoulé depuis start_time
+    en millisecondes.
+    """
+    return (
+        time.perf_counter()
+        - start_time
+    ) * 1000
+
+
+def write_structured_log(
+    *,
+    level: str,
+    event: str,
+    request_id: UUID,
+    status_code: int,
+    latency_ms: float,
+    probability_default: float | None = None,
+    prediction: int | None = None,
+    prediction_label: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """
+    Écrit un événement JSON structuré dans les logs applicatifs.
+
+    Les features d'entrée complètes ne sont pas écrites
+    dans les logs Render afin de limiter l'exposition
+    de données potentiellement sensibles.
+    """
+    log_entry: dict[str, Any] = {
+        "level": level,
+        "event": event,
+        "request_id": str(request_id),
+        "status_code": status_code,
+        "latency_ms": round(
+            latency_ms,
+            3,
+        ),
+        "model_name": MODEL_NAME,
+        "model_version": MODEL_VERSION,
+        "decision_threshold": DECISION_THRESHOLD,
+    }
+
+    if probability_default is not None:
+        log_entry["probability_default"] = float(
+            probability_default
+        )
+
+    if prediction is not None:
+        log_entry["prediction"] = int(
+            prediction
+        )
+
+    if prediction_label is not None:
+        log_entry["prediction_label"] = (
+            prediction_label
+        )
+
+    if error_message is not None:
+        log_entry["error_message"] = (
+            error_message
+        )
+
+    print(
+        json.dumps(
+            log_entry,
+            ensure_ascii=False,
+        )
+    )
 
 
 def log_prediction_safely(
     *,
-    request_id,
-    input_features,
-    probability_default,
-    prediction,
-    prediction_label,
-    threshold,
-    latency_ms,
-    status_code,
-    error_message,
-):
+    request_id: UUID,
+    input_features: dict[str, float],
+    probability_default: float | None,
+    prediction: int | None,
+    prediction_label: str | None,
+    threshold: float,
+    latency_ms: float,
+    status_code: int,
+    error_message: str | None,
+) -> None:
     """
-    Enregistre les données de monitoring sans interrompre l'API
-    si le stockage PostgreSQL/Supabase est indisponible.
+    Persiste les données de monitoring dans PostgreSQL/Supabase.
+
+    Une erreur de stockage ne doit jamais empêcher
+    l'API de retourner sa réponse au client.
     """
     try:
         save_prediction_log(
@@ -100,33 +210,59 @@ def log_prediction_safely(
         )
 
     except Exception as log_error:
-        print(
-            f"Erreur de monitoring pour la requête "
-            f"{request_id}: {log_error}"
+        write_structured_log(
+            level="error",
+            event="monitoring_storage_error",
+            request_id=request_id,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            error_message=str(log_error),
         )
 
+
+# -------------------------------------------------------------------
+# Endpoint de prédiction
+# -------------------------------------------------------------------
 
 @app.post(
     "/predict",
     response_model=PredictionResponse,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[
+        Depends(verify_api_key),
+    ],
 )
-def predict(request: PredictionRequest):
+def predict(
+    request: PredictionRequest,
+) -> PredictionResponse:
     """
-    Calcule la probabilité de défaut d'un client,
-    retourne la décision associée et enregistre
-    les informations de monitoring en base.
+    Calcule la probabilité de défaut d'un client.
+
+    L'endpoint :
+    - génère un request_id unique ;
+    - utilise le modèle XGBoost chargé en mémoire ;
+    - applique le seuil métier ;
+    - retourne le score et la décision ;
+    - mesure la latence ;
+    - persiste les données de monitoring ;
+    - produit des logs JSON structurés.
     """
     request_id = uuid4()
     start_time = time.perf_counter()
 
     try:
-        probability_default = model_service.predict_proba(
-            request.features
+        # -----------------------------------------------------------
+        # Inférence
+        # -----------------------------------------------------------
+
+        probability_default = float(
+            model_service.predict_proba(
+                request.features
+            )
         )
 
         prediction = int(
-            probability_default >= DECISION_THRESHOLD
+            probability_default
+            >= DECISION_THRESHOLD
         )
 
         prediction_label = (
@@ -135,9 +271,13 @@ def predict(request: PredictionRequest):
             else "client_non_risque"
         )
 
-        latency_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
+        latency_ms = compute_latency_ms(
+            start_time
+        )
+
+        # -----------------------------------------------------------
+        # Monitoring PostgreSQL / Supabase
+        # -----------------------------------------------------------
 
         log_prediction_safely(
             request_id=request_id,
@@ -151,17 +291,45 @@ def predict(request: PredictionRequest):
             error_message=None,
         )
 
-        return {
-            "probability_default": probability_default,
-            "prediction": prediction,
-            "prediction_label": prediction_label,
-            "threshold": DECISION_THRESHOLD,
-        }
+        # -----------------------------------------------------------
+        # Logging structuré
+        # -----------------------------------------------------------
+
+        write_structured_log(
+            level="info",
+            event="prediction_success",
+            request_id=request_id,
+            status_code=200,
+            latency_ms=latency_ms,
+            probability_default=probability_default,
+            prediction=prediction,
+            prediction_label=prediction_label,
+        )
+
+        # -----------------------------------------------------------
+        # Réponse API
+        # -----------------------------------------------------------
+
+        return PredictionResponse(
+            request_id=request_id,
+            probability_default=probability_default,
+            prediction=prediction,
+            prediction_label=prediction_label,
+            threshold=DECISION_THRESHOLD,
+        )
+
+    # ----------------------------------------------------------------
+    # Erreur de validation métier / features
+    # ----------------------------------------------------------------
 
     except ValueError as error:
-        latency_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
+        latency_ms = compute_latency_ms(
+            start_time
+        )
+
+        error_message = str(
+            error
+        )
 
         log_prediction_safely(
             request_id=request_id,
@@ -172,18 +340,38 @@ def predict(request: PredictionRequest):
             threshold=DECISION_THRESHOLD,
             latency_ms=latency_ms,
             status_code=422,
-            error_message=str(error),
+            error_message=error_message,
+        )
+
+        write_structured_log(
+            level="warning",
+            event="prediction_validation_error",
+            request_id=request_id,
+            status_code=422,
+            latency_ms=latency_ms,
+            error_message=error_message,
         )
 
         raise HTTPException(
             status_code=422,
-            detail=str(error),
+            detail=error_message,
         ) from error
 
+    # ----------------------------------------------------------------
+    # Préserve les HTTPException déjà construites
+    # ----------------------------------------------------------------
+
+    except HTTPException:
+        raise
+
+    # ----------------------------------------------------------------
+    # Erreur interne inattendue
+    # ----------------------------------------------------------------
+
     except Exception as error:
-        latency_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
+        latency_ms = compute_latency_ms(
+            start_time
+        )
 
         error_message = (
             "Erreur interne lors de la prédiction : "
@@ -199,6 +387,15 @@ def predict(request: PredictionRequest):
             threshold=DECISION_THRESHOLD,
             latency_ms=latency_ms,
             status_code=500,
+            error_message=error_message,
+        )
+
+        write_structured_log(
+            level="error",
+            event="prediction_internal_error",
+            request_id=request_id,
+            status_code=500,
+            latency_ms=latency_ms,
             error_message=error_message,
         )
 

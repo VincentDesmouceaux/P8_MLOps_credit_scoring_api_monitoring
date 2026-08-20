@@ -9,3 +9,20 @@ __pycache__/
 
 # Virtual environment
 .venv/
+
+# Local environment variables
+.env
+.env.*
+
+# Large datasets / monitoring data
+data/monitoring/*.csv
+data/reference/*.csv
+
+# Generated monitoring reports
+reports/*.png
+reports/*.html
+reports/*.json
+reports/*.csv
+
+# OS
+.DS_Store
