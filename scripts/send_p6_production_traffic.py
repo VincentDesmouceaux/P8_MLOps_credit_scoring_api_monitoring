@@ -17,10 +17,8 @@ load_dotenv(
     override=False,
 )
 
-
 API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
-
 
 if not API_URL:
     raise RuntimeError(
@@ -47,6 +45,13 @@ PRODUCTION_FILE = (
 )
 
 
+EXPECTED_FEATURE_COUNT = 656
+
+SAMPLE_SIZE = 100
+
+REQUEST_TIMEOUT_SECONDS = 60.0
+
+
 # -------------------------------------------------------------------
 # Chargement des données
 # -------------------------------------------------------------------
@@ -70,6 +75,13 @@ def load_production_data() -> pd.DataFrame:
             "Le dataset de production P6 est vide."
         )
 
+    if len(dataframe.columns) != EXPECTED_FEATURE_COUNT:
+        raise RuntimeError(
+            "Le dataset ne contient pas exactement "
+            f"{EXPECTED_FEATURE_COUNT} features. "
+            f"Reçu : {len(dataframe.columns)}."
+        )
+
     return dataframe
 
 
@@ -83,12 +95,13 @@ def build_features_payload(
     """
     Convertit une observation pandas en dictionnaire JSON-compatible.
 
-    Les NaN pandas sont transformés en None afin qu'ils soient
-    sérialisés en null dans la requête JSON.
+    Les valeurs NaN sont converties en None afin d'être
+    sérialisées en null dans la requête JSON.
 
-    L'API reconstruira ensuite ces valeurs manquantes pour XGBoost.
+    L'API reconstruira ensuite ces valeurs manquantes
+    sous forme de np.nan pour XGBoost.
     """
-    return {
+    features = {
         column: (
             None
             if pd.isna(value)
@@ -97,18 +110,27 @@ def build_features_payload(
         for column, value in row.items()
     }
 
+    if len(features) != EXPECTED_FEATURE_COUNT:
+        raise RuntimeError(
+            "Le payload ne contient pas exactement "
+            f"{EXPECTED_FEATURE_COUNT} features."
+        )
+
+    return features
+
 
 # -------------------------------------------------------------------
 # Envoi d'une observation
 # -------------------------------------------------------------------
 
 def send_prediction(
+    client: httpx.Client,
     features: dict[str, float | None],
 ) -> httpx.Response:
     """
     Envoie une observation P6 à l'API Render.
     """
-    return httpx.post(
+    return client.post(
         PREDICT_URL,
         json={
             "features": features,
@@ -116,7 +138,6 @@ def send_prediction(
         headers={
             "X-API-Key": API_KEY,
         },
-        timeout=60.0,
     )
 
 
@@ -128,7 +149,7 @@ def main() -> None:
     dataframe = load_production_data()
 
     print(
-        "\n=== TEST TRAFIC P6 -> API P8 ===\n"
+        "\n=== TRAFIC P6 -> API P8 ===\n"
     )
 
     print(
@@ -141,122 +162,220 @@ def main() -> None:
         PREDICT_URL,
     )
 
-    # ---------------------------------------------------------------
-    # Une seule observation pour commencer
-    # ---------------------------------------------------------------
-
-    row = dataframe.iloc[0]
-
-    missing_values_count = int(
-        row.isna().sum()
+    sample_size = min(
+        SAMPLE_SIZE,
+        len(dataframe),
     )
 
-    features = build_features_payload(
-        row
+    sample_df = dataframe.head(
+        sample_size
+    )
+
+    successful_requests = 0
+    failed_requests = 0
+
+    request_ids: list[str] = []
+
+    total_missing_values = 0
+
+    # ---------------------------------------------------------------
+    # Client HTTP réutilisé pour les 100 requêtes
+    # ---------------------------------------------------------------
+
+    timeout = httpx.Timeout(
+        REQUEST_TIMEOUT_SECONDS
+    )
+
+    with httpx.Client(
+        timeout=timeout
+    ) as client:
+
+        for index, (_, row) in enumerate(
+            sample_df.iterrows(),
+            start=1,
+        ):
+            missing_values_count = int(
+                row.isna().sum()
+            )
+
+            total_missing_values += (
+                missing_values_count
+            )
+
+            features = build_features_payload(
+                row
+            )
+
+            try:
+                response = send_prediction(
+                    client=client,
+                    features=features,
+                )
+
+            except httpx.TimeoutException:
+                failed_requests += 1
+
+                print(
+                    f"[{index}/{sample_size}] "
+                    "TIMEOUT"
+                )
+
+                continue
+
+            except httpx.HTTPError as error:
+                failed_requests += 1
+
+                print(
+                    f"[{index}/{sample_size}] "
+                    f"ERREUR HTTP : {error}"
+                )
+
+                continue
+
+            # -------------------------------------------------------
+            # Lecture JSON
+            # -------------------------------------------------------
+
+            try:
+                payload = response.json()
+
+            except ValueError:
+                failed_requests += 1
+
+                print(
+                    f"[{index}/{sample_size}] "
+                    f"{response.status_code} | "
+                    "réponse non JSON"
+                )
+
+                continue
+
+            # -------------------------------------------------------
+            # Succès
+            # -------------------------------------------------------
+
+            if response.status_code == 200:
+                successful_requests += 1
+
+                request_id = payload.get(
+                    "request_id"
+                )
+
+                if request_id:
+                    request_ids.append(
+                        request_id
+                    )
+
+                probability_default = payload.get(
+                    "probability_default"
+                )
+
+                prediction = payload.get(
+                    "prediction"
+                )
+
+                if isinstance(
+                    probability_default,
+                    (int, float),
+                ):
+                    score_display = (
+                        f"{probability_default:.4f}"
+                    )
+                else:
+                    score_display = "N/A"
+
+                print(
+                    f"[{index}/{sample_size}] "
+                    f"200 | "
+                    f"prediction={prediction} | "
+                    f"score={score_display} | "
+                    f"null={missing_values_count}"
+                )
+
+                continue
+
+            # -------------------------------------------------------
+            # Erreur API
+            # -------------------------------------------------------
+
+            failed_requests += 1
+
+            print(
+                f"[{index}/{sample_size}] "
+                f"{response.status_code} | "
+                f"{payload}"
+            )
+
+    # ----------------------------------------------------------------
+    # Résumé
+    # ----------------------------------------------------------------
+
+    print(
+        "\n=== RESUME TRAFIC P6 ===\n"
     )
 
     print(
-        "Features envoyées :",
-        len(features),
+        "Observations prévues :",
+        sample_size,
     )
 
     print(
-        "Valeurs manquantes converties en null :",
-        missing_values_count,
+        "Succès :",
+        successful_requests,
     )
-
-    if len(features) != 656:
-        raise RuntimeError(
-            "Le payload ne contient pas exactement "
-            "les 656 features attendues."
-        )
-
-    # ---------------------------------------------------------------
-    # Appel API
-    # ---------------------------------------------------------------
-
-    try:
-        response = send_prediction(
-            features
-        )
-
-    except httpx.TimeoutException as error:
-        raise RuntimeError(
-            "Timeout lors de l'appel à l'API Render."
-        ) from error
-
-    except httpx.HTTPError as error:
-        raise RuntimeError(
-            "Erreur HTTP lors de l'appel à l'API Render : "
-            f"{error}"
-        ) from error
 
     print(
-        "Status code :",
-        response.status_code,
+        "Échecs :",
+        failed_requests,
     )
 
-    # ---------------------------------------------------------------
-    # Lecture de la réponse
-    # ---------------------------------------------------------------
+    print(
+        "request_id récupérés :",
+        len(request_ids),
+    )
 
-    try:
-        payload = response.json()
+    print(
+        "Valeurs manquantes transmises en null :",
+        total_missing_values,
+    )
 
-    except ValueError:
+    success_rate = (
+        successful_requests / sample_size
+        if sample_size > 0
+        else 0.0
+    )
+
+    print(
+        "Taux de succès :",
+        f"{success_rate * 100:.2f} %",
+    )
+
+    if successful_requests == sample_size:
         print(
-            "Réponse non JSON :",
-            response.text,
-        )
-
-        raise RuntimeError(
-            "L'API n'a pas retourné une réponse JSON valide."
-        )
-
-    print(
-        "Réponse API :",
-        payload,
-    )
-
-    # ---------------------------------------------------------------
-    # Validation
-    # ---------------------------------------------------------------
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            "La première observation P6 "
-            "n'a pas été acceptée par l'API. "
-            f"Status={response.status_code}, "
-            f"réponse={payload}"
-        )
-
-    print(
-        "\nPremière observation P6 envoyée avec succès."
-    )
-
-    request_id = payload.get(
-        "request_id"
-    )
-
-    if request_id:
-        print(
-            "request_id :",
-            request_id,
-        )
-
-        print(
-            "\nLa prédiction peut maintenant être "
-            "retrouvée précisément dans Supabase."
+            "\nLes observations P6 ont toutes été "
+            "traitées avec succès."
         )
 
     else:
         print(
-            "\nATTENTION : request_id absent de la réponse."
+            "\nATTENTION : certaines observations "
+            "n'ont pas été acceptées par l'API."
+        )
+
+    if request_ids:
+        print(
+            "\nPremier request_id :",
+            request_ids[0],
         )
 
         print(
-            "La version Render n'intègre probablement "
-            "pas encore la dernière version de l'API."
+            "Dernier request_id :",
+            request_ids[-1],
+        )
+
+        print(
+            "\nCes identifiants peuvent être utilisés "
+            "pour retrouver les prédictions dans Supabase."
         )
 
 
