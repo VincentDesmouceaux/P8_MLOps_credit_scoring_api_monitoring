@@ -5,7 +5,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+)
 
 from app.monitoring.prediction_logger import save_prediction_log
 from app.schemas.prediction import PredictionRequest, PredictionResponse
@@ -97,6 +102,9 @@ def model_info() -> dict[str, Any]:
             "NumPy float32 + "
             "XGBoost Booster.inplace_predict"
         ),
+        "monitoring_persistence": (
+            "FastAPI BackgroundTasks + PostgreSQL/Supabase"
+        ),
         "deploy_commit": os.getenv(
             "RENDER_GIT_COMMIT",
             "local",
@@ -142,18 +150,14 @@ def write_structured_log(
     """
     Écrit un événement JSON structuré dans les logs applicatifs.
 
-    Les 656 features d'entrée ne sont volontairement pas écrites
-    dans les logs Render afin de limiter l'exposition de données.
+    Les features complètes ne sont pas écrites dans les logs Render.
+    Elles sont stockées séparément dans PostgreSQL/Supabase.
 
-    Les inputs complets sont persistés séparément dans
-    PostgreSQL/Supabase.
-
-    Deux mesures sont distinguées :
-    - latency_ms : temps de préparation + inférence du modèle ;
-    - monitoring_storage_ms : temps consacré à l'écriture Supabase.
-
-    handler_total_ms représente le temps total mesuré dans
-    le handler jusqu'à la génération du log structuré.
+    Les principales mesures sont :
+    - latency_ms : préparation + inférence ;
+    - handler_total_ms : temps passé dans l'endpoint avant réponse ;
+    - monitoring_storage_ms : durée du stockage exécuté
+      en arrière-plan.
     """
     log_entry: dict[str, Any] = {
         "level": level,
@@ -228,11 +232,10 @@ def log_prediction_safely(
     """
     Persiste les données de monitoring dans PostgreSQL/Supabase.
 
-    Retourne le temps consacré à l'écriture afin de mesurer
-    précisément le coût du monitoring synchrone.
+    Retourne la durée du stockage en millisecondes.
 
-    Une panne du stockage ne doit jamais empêcher l'API
-    de retourner sa réponse au client.
+    Cette fonction est destinée à être exécutée hors du chemin
+    critique de la réponse HTTP via BackgroundTasks.
     """
     storage_start = time.perf_counter()
 
@@ -275,6 +278,47 @@ def log_prediction_safely(
     )
 
 
+def persist_prediction_in_background(
+    *,
+    request_id: UUID,
+    input_features: dict[str, float | None],
+    probability_default: float | None,
+    prediction: int | None,
+    prediction_label: str | None,
+    threshold: float,
+    latency_ms: float,
+    status_code: int,
+    error_message: str | None,
+) -> None:
+    """
+    Exécute la persistance du monitoring après génération
+    de la réponse HTTP.
+
+    Le temps de stockage est loggé séparément afin de conserver
+    la visibilité sur le coût PostgreSQL/Supabase.
+    """
+    monitoring_storage_ms = log_prediction_safely(
+        request_id=request_id,
+        input_features=input_features,
+        probability_default=probability_default,
+        prediction=prediction,
+        prediction_label=prediction_label,
+        threshold=threshold,
+        latency_ms=latency_ms,
+        status_code=status_code,
+        error_message=error_message,
+    )
+
+    write_structured_log(
+        level="info",
+        event="monitoring_background_storage",
+        request_id=request_id,
+        status_code=status_code,
+        latency_ms=latency_ms,
+        monitoring_storage_ms=monitoring_storage_ms,
+    )
+
+
 # -------------------------------------------------------------------
 # Endpoint de prédiction
 # -------------------------------------------------------------------
@@ -288,6 +332,7 @@ def log_prediction_safely(
 )
 def predict(
     request: PredictionRequest,
+    background_tasks: BackgroundTasks,
 ) -> PredictionResponse:
     """
     Calcule la probabilité de défaut d'un client.
@@ -296,10 +341,9 @@ def predict(
     - génère un request_id ;
     - exécute l'inférence optimisée NumPy/XGBoost ;
     - applique le seuil métier ;
-    - mesure séparément l'inférence et l'écriture Supabase ;
-    - persiste les données de monitoring ;
-    - produit un log JSON structuré ;
-    - retourne la prédiction au client.
+    - mesure le temps d'inférence ;
+    - planifie le stockage Supabase en tâche de fond ;
+    - retourne la réponse sans attendre PostgreSQL/Supabase.
     """
     request_id = uuid4()
 
@@ -328,27 +372,25 @@ def predict(
             else "client_non_risque"
         )
 
-        # Temps consacré à la préparation + inférence.
         latency_ms = compute_latency_ms(
             inference_start
         )
 
         # -----------------------------------------------------------
-        # Persistance monitoring synchrone
+        # Persistance monitoring en arrière-plan
         # -----------------------------------------------------------
 
-        monitoring_storage_ms = (
-            log_prediction_safely(
-                request_id=request_id,
-                input_features=request.features,
-                probability_default=probability_default,
-                prediction=prediction,
-                prediction_label=prediction_label,
-                threshold=DECISION_THRESHOLD,
-                latency_ms=latency_ms,
-                status_code=200,
-                error_message=None,
-            )
+        background_tasks.add_task(
+            persist_prediction_in_background,
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=probability_default,
+            prediction=prediction,
+            prediction_label=prediction_label,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=200,
+            error_message=None,
         )
 
         handler_total_ms = compute_latency_ms(
@@ -356,7 +398,7 @@ def predict(
         )
 
         # -----------------------------------------------------------
-        # Log JSON applicatif
+        # Log applicatif du chemin critique
         # -----------------------------------------------------------
 
         write_structured_log(
@@ -368,7 +410,6 @@ def predict(
             probability_default=probability_default,
             prediction=prediction,
             prediction_label=prediction_label,
-            monitoring_storage_ms=monitoring_storage_ms,
             handler_total_ms=handler_total_ms,
         )
 
@@ -397,18 +438,17 @@ def predict(
             error
         )
 
-        monitoring_storage_ms = (
-            log_prediction_safely(
-                request_id=request_id,
-                input_features=request.features,
-                probability_default=None,
-                prediction=None,
-                prediction_label=None,
-                threshold=DECISION_THRESHOLD,
-                latency_ms=latency_ms,
-                status_code=422,
-                error_message=error_message,
-            )
+        background_tasks.add_task(
+            persist_prediction_in_background,
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=None,
+            prediction=None,
+            prediction_label=None,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=422,
+            error_message=error_message,
         )
 
         handler_total_ms = compute_latency_ms(
@@ -421,7 +461,6 @@ def predict(
             request_id=request_id,
             status_code=422,
             latency_ms=latency_ms,
-            monitoring_storage_ms=monitoring_storage_ms,
             handler_total_ms=handler_total_ms,
             error_message=error_message,
         )
@@ -452,18 +491,17 @@ def predict(
             f"{error}"
         )
 
-        monitoring_storage_ms = (
-            log_prediction_safely(
-                request_id=request_id,
-                input_features=request.features,
-                probability_default=None,
-                prediction=None,
-                prediction_label=None,
-                threshold=DECISION_THRESHOLD,
-                latency_ms=latency_ms,
-                status_code=500,
-                error_message=error_message,
-            )
+        background_tasks.add_task(
+            persist_prediction_in_background,
+            request_id=request_id,
+            input_features=request.features,
+            probability_default=None,
+            prediction=None,
+            prediction_label=None,
+            threshold=DECISION_THRESHOLD,
+            latency_ms=latency_ms,
+            status_code=500,
+            error_message=error_message,
         )
 
         handler_total_ms = compute_latency_ms(
@@ -476,7 +514,6 @@ def predict(
             request_id=request_id,
             status_code=500,
             latency_ms=latency_ms,
-            monitoring_storage_ms=monitoring_storage_ms,
             handler_total_ms=handler_total_ms,
             error_message=error_message,
         )
