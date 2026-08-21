@@ -1,7 +1,7 @@
 import os
 
 from fastapi.testclient import TestClient
-
+from app.main import API_VERSION
 from app.main import app
 from app.services.model_service import model_service
 
@@ -39,7 +39,7 @@ def test_health():
 
     assert data["status"] == "ok"
     assert data["service"] == "p8-credit-scoring-api"
-    assert data["version"] == "0.2.0"
+    assert data["version"] == API_VERSION
 
 
 def test_model_info():

@@ -18,7 +18,7 @@ from app.services.model_service import model_service
 # -------------------------------------------------------------------
 
 API_TITLE = "P8 Credit Scoring API"
-API_VERSION = "0.2.0"
+API_VERSION = "0.4.0"
 API_SERVICE_NAME = "p8-credit-scoring-api"
 
 
@@ -89,8 +89,14 @@ def model_info() -> dict[str, Any]:
         "model_family": MODEL_FAMILY,
         "mlflow_alias": MLFLOW_ALIAS,
         "decision_threshold": DECISION_THRESHOLD,
-        "n_features": len(model_service.feature_names),
+        "n_features": len(
+            model_service.feature_names
+        ),
         "loaded": model_service.loaded,
+        "inference_pipeline": (
+            "NumPy float32 + "
+            "XGBoost Booster.inplace_predict"
+        ),
         "deploy_commit": os.getenv(
             "RENDER_GIT_COMMIT",
             "local",
@@ -99,7 +105,7 @@ def model_info() -> dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# Utilitaires monitoring
+# Utilitaires de mesure
 # -------------------------------------------------------------------
 
 def compute_latency_ms(
@@ -115,6 +121,10 @@ def compute_latency_ms(
     ) * 1000
 
 
+# -------------------------------------------------------------------
+# Logging structuré
+# -------------------------------------------------------------------
+
 def write_structured_log(
     *,
     level: str,
@@ -125,14 +135,25 @@ def write_structured_log(
     probability_default: float | None = None,
     prediction: int | None = None,
     prediction_label: str | None = None,
+    monitoring_storage_ms: float | None = None,
+    handler_total_ms: float | None = None,
     error_message: str | None = None,
 ) -> None:
     """
     Écrit un événement JSON structuré dans les logs applicatifs.
 
-    Les features d'entrée complètes ne sont pas écrites
-    dans les logs Render afin de limiter l'exposition
-    de données potentiellement sensibles.
+    Les 656 features d'entrée ne sont volontairement pas écrites
+    dans les logs Render afin de limiter l'exposition de données.
+
+    Les inputs complets sont persistés séparément dans
+    PostgreSQL/Supabase.
+
+    Deux mesures sont distinguées :
+    - latency_ms : temps de préparation + inférence du modèle ;
+    - monitoring_storage_ms : temps consacré à l'écriture Supabase.
+
+    handler_total_ms représente le temps total mesuré dans
+    le handler jusqu'à la génération du log structuré.
     """
     log_entry: dict[str, Any] = {
         "level": level,
@@ -163,6 +184,18 @@ def write_structured_log(
             prediction_label
         )
 
+    if monitoring_storage_ms is not None:
+        log_entry["monitoring_storage_ms"] = round(
+            monitoring_storage_ms,
+            3,
+        )
+
+    if handler_total_ms is not None:
+        log_entry["handler_total_ms"] = round(
+            handler_total_ms,
+            3,
+        )
+
     if error_message is not None:
         log_entry["error_message"] = (
             error_message
@@ -176,10 +209,14 @@ def write_structured_log(
     )
 
 
+# -------------------------------------------------------------------
+# Persistance monitoring
+# -------------------------------------------------------------------
+
 def log_prediction_safely(
     *,
     request_id: UUID,
-    input_features: dict[str, float],
+    input_features: dict[str, float | None],
     probability_default: float | None,
     prediction: int | None,
     prediction_label: str | None,
@@ -187,13 +224,18 @@ def log_prediction_safely(
     latency_ms: float,
     status_code: int,
     error_message: str | None,
-) -> None:
+) -> float:
     """
     Persiste les données de monitoring dans PostgreSQL/Supabase.
 
-    Une erreur de stockage ne doit jamais empêcher
-    l'API de retourner sa réponse au client.
+    Retourne le temps consacré à l'écriture afin de mesurer
+    précisément le coût du monitoring synchrone.
+
+    Une panne du stockage ne doit jamais empêcher l'API
+    de retourner sa réponse au client.
     """
+    storage_start = time.perf_counter()
+
     try:
         save_prediction_log(
             request_id=request_id,
@@ -210,14 +252,27 @@ def log_prediction_safely(
         )
 
     except Exception as log_error:
+        storage_ms = compute_latency_ms(
+            storage_start
+        )
+
         write_structured_log(
             level="error",
             event="monitoring_storage_error",
             request_id=request_id,
             status_code=status_code,
             latency_ms=latency_ms,
-            error_message=str(log_error),
+            monitoring_storage_ms=storage_ms,
+            error_message=str(
+                log_error
+            ),
         )
+
+        return storage_ms
+
+    return compute_latency_ms(
+        storage_start
+    )
 
 
 # -------------------------------------------------------------------
@@ -237,21 +292,23 @@ def predict(
     """
     Calcule la probabilité de défaut d'un client.
 
-    L'endpoint :
-    - génère un request_id unique ;
-    - utilise le modèle XGBoost chargé en mémoire ;
+    Le pipeline :
+    - génère un request_id ;
+    - exécute l'inférence optimisée NumPy/XGBoost ;
     - applique le seuil métier ;
-    - retourne le score et la décision ;
-    - mesure la latence ;
+    - mesure séparément l'inférence et l'écriture Supabase ;
     - persiste les données de monitoring ;
-    - produit des logs JSON structurés.
+    - produit un log JSON structuré ;
+    - retourne la prédiction au client.
     """
     request_id = uuid4()
-    start_time = time.perf_counter()
+
+    handler_start = time.perf_counter()
+    inference_start = time.perf_counter()
 
     try:
         # -----------------------------------------------------------
-        # Inférence
+        # Inférence optimisée
         # -----------------------------------------------------------
 
         probability_default = float(
@@ -271,28 +328,35 @@ def predict(
             else "client_non_risque"
         )
 
+        # Temps consacré à la préparation + inférence.
         latency_ms = compute_latency_ms(
-            start_time
+            inference_start
         )
 
         # -----------------------------------------------------------
-        # Monitoring PostgreSQL / Supabase
+        # Persistance monitoring synchrone
         # -----------------------------------------------------------
 
-        log_prediction_safely(
-            request_id=request_id,
-            input_features=request.features,
-            probability_default=probability_default,
-            prediction=prediction,
-            prediction_label=prediction_label,
-            threshold=DECISION_THRESHOLD,
-            latency_ms=latency_ms,
-            status_code=200,
-            error_message=None,
+        monitoring_storage_ms = (
+            log_prediction_safely(
+                request_id=request_id,
+                input_features=request.features,
+                probability_default=probability_default,
+                prediction=prediction,
+                prediction_label=prediction_label,
+                threshold=DECISION_THRESHOLD,
+                latency_ms=latency_ms,
+                status_code=200,
+                error_message=None,
+            )
+        )
+
+        handler_total_ms = compute_latency_ms(
+            handler_start
         )
 
         # -----------------------------------------------------------
-        # Logging structuré
+        # Log JSON applicatif
         # -----------------------------------------------------------
 
         write_structured_log(
@@ -304,6 +368,8 @@ def predict(
             probability_default=probability_default,
             prediction=prediction,
             prediction_label=prediction_label,
+            monitoring_storage_ms=monitoring_storage_ms,
+            handler_total_ms=handler_total_ms,
         )
 
         # -----------------------------------------------------------
@@ -319,28 +385,34 @@ def predict(
         )
 
     # ----------------------------------------------------------------
-    # Erreur de validation métier / features
+    # Erreur métier / features invalides
     # ----------------------------------------------------------------
 
     except ValueError as error:
         latency_ms = compute_latency_ms(
-            start_time
+            inference_start
         )
 
         error_message = str(
             error
         )
 
-        log_prediction_safely(
-            request_id=request_id,
-            input_features=request.features,
-            probability_default=None,
-            prediction=None,
-            prediction_label=None,
-            threshold=DECISION_THRESHOLD,
-            latency_ms=latency_ms,
-            status_code=422,
-            error_message=error_message,
+        monitoring_storage_ms = (
+            log_prediction_safely(
+                request_id=request_id,
+                input_features=request.features,
+                probability_default=None,
+                prediction=None,
+                prediction_label=None,
+                threshold=DECISION_THRESHOLD,
+                latency_ms=latency_ms,
+                status_code=422,
+                error_message=error_message,
+            )
+        )
+
+        handler_total_ms = compute_latency_ms(
+            handler_start
         )
 
         write_structured_log(
@@ -349,6 +421,8 @@ def predict(
             request_id=request_id,
             status_code=422,
             latency_ms=latency_ms,
+            monitoring_storage_ms=monitoring_storage_ms,
+            handler_total_ms=handler_total_ms,
             error_message=error_message,
         )
 
@@ -358,7 +432,7 @@ def predict(
         ) from error
 
     # ----------------------------------------------------------------
-    # Préserve les HTTPException déjà construites
+    # Préserve les HTTPException explicites
     # ----------------------------------------------------------------
 
     except HTTPException:
@@ -370,7 +444,7 @@ def predict(
 
     except Exception as error:
         latency_ms = compute_latency_ms(
-            start_time
+            inference_start
         )
 
         error_message = (
@@ -378,16 +452,22 @@ def predict(
             f"{error}"
         )
 
-        log_prediction_safely(
-            request_id=request_id,
-            input_features=request.features,
-            probability_default=None,
-            prediction=None,
-            prediction_label=None,
-            threshold=DECISION_THRESHOLD,
-            latency_ms=latency_ms,
-            status_code=500,
-            error_message=error_message,
+        monitoring_storage_ms = (
+            log_prediction_safely(
+                request_id=request_id,
+                input_features=request.features,
+                probability_default=None,
+                prediction=None,
+                prediction_label=None,
+                threshold=DECISION_THRESHOLD,
+                latency_ms=latency_ms,
+                status_code=500,
+                error_message=error_message,
+            )
+        )
+
+        handler_total_ms = compute_latency_ms(
+            handler_start
         )
 
         write_structured_log(
@@ -396,6 +476,8 @@ def predict(
             request_id=request_id,
             status_code=500,
             latency_ms=latency_ms,
+            monitoring_storage_ms=monitoring_storage_ms,
+            handler_total_ms=handler_total_ms,
             error_message=error_message,
         )
 
