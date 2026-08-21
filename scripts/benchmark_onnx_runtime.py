@@ -2,6 +2,7 @@ import json
 import time
 from pathlib import Path
 
+import mlflow.xgboost
 import numpy as np
 import onnxruntime as ort
 import pandas as pd
@@ -22,11 +23,10 @@ PRODUCTION_FILE = (
     / "p6_production_full.csv"
 )
 
-ONNX_MODEL_PATH = (
+XGBOOST_MODEL_PATH = (
     PROJECT_ROOT
     / "models"
-    / "onnx"
-    / "credit_scoring_model.onnx"
+    / "credit_scoring_model"
 )
 
 REPORTS_DIR = (
@@ -48,6 +48,7 @@ SAMPLE_SIZE = 500
 WARMUP_RUNS = 20
 
 EXPECTED_FEATURE_COUNT = 656
+DECISION_THRESHOLD = 0.45
 
 
 # -------------------------------------------------------------------
@@ -56,8 +57,10 @@ EXPECTED_FEATURE_COUNT = 656
 
 def load_sample() -> pd.DataFrame:
     """
-    Charge un échantillon P6 dans l'ordre exact
-    des features attendu par le modèle.
+    Charge un échantillon de données P6.
+
+    Les colonnes doivent correspondre exactement
+    aux 656 features attendues par le modèle.
     """
     if not PRODUCTION_FILE.exists():
         raise FileNotFoundError(
@@ -74,13 +77,20 @@ def load_sample() -> pd.DataFrame:
             "Le dataset de benchmark est vide."
         )
 
+    if len(dataframe.columns) != EXPECTED_FEATURE_COUNT:
+        raise RuntimeError(
+            "Le dataset ne contient pas exactement "
+            f"{EXPECTED_FEATURE_COUNT} features. "
+            f"Reçu : {len(dataframe.columns)}."
+        )
+
     if (
         dataframe.columns.tolist()
         != model_service.feature_names
     ):
         raise RuntimeError(
-            "Les features du dataset ne sont pas "
-            "dans l'ordre attendu par le modèle."
+            "Les features du dataset ne correspondent "
+            "pas exactement à l'ordre attendu par le modèle."
         )
 
     return dataframe
@@ -94,97 +104,132 @@ def row_to_numpy(
     row: pd.Series,
 ) -> np.ndarray:
     """
-    Convertit une observation P6 en float32.
+    Convertit une observation pandas en tableau NumPy float32
+    de shape (1, 656).
 
-    Les NaN sont conservés afin de reproduire le comportement
-    du modèle XGBoost original.
+    Les NaN sont conservés afin de reproduire exactement
+    le comportement attendu par XGBoost et ONNX Runtime.
     """
     values = row.to_numpy(
         dtype=np.float32,
         copy=True,
     )
 
-    if values.shape[0] != EXPECTED_FEATURE_COUNT:
+    if values.shape != (
+        EXPECTED_FEATURE_COUNT,
+    ):
         raise RuntimeError(
-            "Nombre de features incorrect."
+            "Shape inattendue après conversion NumPy : "
+            f"{values.shape}"
         )
 
     return values.reshape(
         1,
-        -1,
+        EXPECTED_FEATURE_COUNT,
     )
 
 
 # -------------------------------------------------------------------
-# Session ONNX
+# Chargement XGBoost de référence
 # -------------------------------------------------------------------
 
-def create_onnx_session() -> ort.InferenceSession:
+def load_reference_xgboost():
     """
-    Initialise ONNX Runtime en CPU.
+    Charge le modèle XGBoost original.
 
-    L'utilisation CPU est volontaire afin de comparer les deux
-    moteurs dans un contexte proche de l'environnement Render.
+    Ce modèle n'est utilisé que comme référence
+    pour comparer ONNX Runtime au modèle source.
     """
-    if not ONNX_MODEL_PATH.exists():
+    if not XGBOOST_MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Modèle ONNX introuvable : "
-            f"{ONNX_MODEL_PATH}"
+            "Modèle XGBoost de référence introuvable : "
+            f"{XGBOOST_MODEL_PATH}"
         )
 
-    session_options = ort.SessionOptions()
-
-    return ort.InferenceSession(
-        str(ONNX_MODEL_PATH),
-        sess_options=session_options,
-        providers=[
-            "CPUExecutionProvider",
-        ],
+    model = mlflow.xgboost.load_model(
+        str(XGBOOST_MODEL_PATH)
     )
 
-
-# -------------------------------------------------------------------
-# Prédiction XGBoost
-# -------------------------------------------------------------------
-
-def predict_xgboost(
-    row: pd.Series,
-) -> float:
-    """
-    Pipeline optimisé actuellement retenu en production.
-    """
-    input_array = row_to_numpy(
-        row
-    )
-
-    if model_service.booster is None:
+    if model is None:
         raise RuntimeError(
-            "Booster XGBoost non chargé."
+            "Le modèle XGBoost de référence "
+            "n'a pas pu être chargé."
         )
 
-    prediction = (
-        model_service.booster.inplace_predict(
-            input_array
-        )
-    )
+    try:
+        booster = model.get_booster()
 
-    return float(
-        prediction[0]
+    except AttributeError as error:
+        raise RuntimeError(
+            "Impossible de récupérer le Booster "
+            "du modèle XGBoost de référence."
+        ) from error
+
+    if booster is None:
+        raise RuntimeError(
+            "Booster XGBoost indisponible."
+        )
+
+    return booster
+
+
+# -------------------------------------------------------------------
+# Session ONNX de production
+# -------------------------------------------------------------------
+
+def get_production_onnx_session(
+) -> tuple[
+    ort.InferenceSession,
+    str,
+    str,
+]:
+    """
+    Retourne exactement la session ONNX utilisée
+    par ModelService en production.
+
+    Le benchmark mesure donc la configuration réelle :
+    - CPUExecutionProvider ;
+    - ORT_SEQUENTIAL ;
+    - intra_op_num_threads = 1 ;
+    - inter_op_num_threads = 1.
+    """
+    model_service.load()
+
+    if model_service.session is None:
+        raise RuntimeError(
+            "Session ONNX Runtime non chargée."
+        )
+
+    if model_service.input_name is None:
+        raise RuntimeError(
+            "Nom d'entrée ONNX indisponible."
+        )
+
+    if (
+        model_service.probabilities_output_name
+        is None
+    ):
+        raise RuntimeError(
+            "Nom de sortie probabilities indisponible."
+        )
+
+    return (
+        model_service.session,
+        model_service.input_name,
+        model_service.probabilities_output_name,
     )
 
 
 # -------------------------------------------------------------------
-# Prédiction ONNX
+# Inspection ONNX
 # -------------------------------------------------------------------
 
-def inspect_onnx_outputs(
+def inspect_onnx_session(
     session: ort.InferenceSession,
 ) -> None:
     """
-    Affiche les entrées/sorties du modèle ONNX.
-
-    Cela permet de vérifier le format réellement produit
-    par le convertisseur avant d'interpréter les probabilités.
+    Affiche les caractéristiques principales
+    de la session ONNX Runtime.
     """
     print(
         "\n=== STRUCTURE ONNX ===\n"
@@ -214,116 +259,183 @@ def inspect_onnx_outputs(
             output_info.type,
         )
 
-
-def extract_onnx_probability(
-    outputs: list,
-) -> float:
-    """
-    Extrait la probabilité de la classe positive.
-
-    Les convertisseurs XGBoost ONNX peuvent produire
-    différents formats :
-    - tableau de probabilités ;
-    - liste de dictionnaires ;
-    - sortie label + probabilities.
-    """
-    if not outputs:
-        raise RuntimeError(
-            "Aucune sortie ONNX."
-        )
-
-    # ---------------------------------------------------------------
-    # Cherche d'abord une sortie de probabilités exploitable
-    # ---------------------------------------------------------------
-
-    for output in outputs:
-        # Cas ndarray classique
-        if isinstance(
-            output,
-            np.ndarray,
-        ):
-            if (
-                output.ndim == 2
-                and output.shape[0] == 1
-                and output.shape[1] >= 2
-            ):
-                return float(
-                    output[0][1]
-                )
-
-        # Cas ZipMap : [{0: p0, 1: p1}]
-        if isinstance(
-            output,
-            list,
-        ):
-            if (
-                len(output) == 1
-                and isinstance(
-                    output[0],
-                    dict,
-                )
-            ):
-                probabilities = output[0]
-
-                if 1 in probabilities:
-                    return float(
-                        probabilities[1]
-                    )
-
-                if "1" in probabilities:
-                    return float(
-                        probabilities["1"]
-                    )
-
-    raise RuntimeError(
-        "Impossible d'identifier la probabilité "
-        "de la classe positive dans les sorties ONNX."
+    print(
+        "\nProviders actifs :",
+        session.get_providers(),
     )
 
+    print(
+        "Mode d'exécution : ORT_SEQUENTIAL"
+    )
+
+    print(
+        "Threads intra-op : 1"
+    )
+
+    print(
+        "Threads inter-op : 1"
+    )
+
+
+# -------------------------------------------------------------------
+# Prédiction XGBoost
+# -------------------------------------------------------------------
+
+def predict_xgboost(
+    booster,
+    row: pd.Series,
+) -> float:
+    """
+    Exécute une prédiction avec le Booster
+    XGBoost de référence.
+    """
+    input_array = row_to_numpy(
+        row
+    )
+
+    predictions = booster.inplace_predict(
+        input_array
+    )
+
+    if len(predictions) != 1:
+        raise RuntimeError(
+            "Format inattendu retourné "
+            "par XGBoost."
+        )
+
+    probability = float(
+        predictions[0]
+    )
+
+    if not np.isfinite(
+        probability
+    ):
+        raise RuntimeError(
+            "La probabilité XGBoost "
+            "n'est pas finie."
+        )
+
+    if not (
+        0.0
+        <= probability
+        <= 1.0
+    ):
+        raise RuntimeError(
+            "La probabilité XGBoost "
+            "n'est pas comprise entre 0 et 1."
+        )
+
+    return probability
+
+
+# -------------------------------------------------------------------
+# Prédiction ONNX
+# -------------------------------------------------------------------
 
 def predict_onnx(
     session: ort.InferenceSession,
     input_name: str,
+    probabilities_output_name: str,
     row: pd.Series,
 ) -> float:
     """
-    Exécute une prédiction avec ONNX Runtime.
+    Exécute une prédiction avec la session
+    ONNX Runtime utilisée en production.
     """
     input_array = row_to_numpy(
         row
     )
 
     outputs = session.run(
-        None,
+        [
+            probabilities_output_name,
+        ],
         {
             input_name: input_array,
         },
     )
 
-    return extract_onnx_probability(
-        outputs
+    if len(outputs) != 1:
+        raise RuntimeError(
+            "Nombre de sorties ONNX inattendu."
+        )
+
+    probabilities = outputs[0]
+
+    if not isinstance(
+        probabilities,
+        np.ndarray,
+    ):
+        raise RuntimeError(
+            "La sortie probabilities "
+            "n'est pas un tableau NumPy."
+        )
+
+    if probabilities.shape != (
+        1,
+        2,
+    ):
+        raise RuntimeError(
+            "Shape ONNX inattendue : "
+            f"{probabilities.shape}"
+        )
+
+    probability = float(
+        probabilities[0][1]
     )
+
+    if not np.isfinite(
+        probability
+    ):
+        raise RuntimeError(
+            "La probabilité ONNX "
+            "n'est pas finie."
+        )
+
+    if not (
+        0.0
+        <= probability
+        <= 1.0
+    ):
+        raise RuntimeError(
+            "La probabilité ONNX "
+            "n'est pas comprise entre 0 et 1."
+        )
+
+    return probability
 
 
 # -------------------------------------------------------------------
-# Benchmark
+# Benchmark générique
 # -------------------------------------------------------------------
 
 def benchmark(
     dataframe: pd.DataFrame,
     predict_function,
-) -> tuple[np.ndarray, list[float]]:
+) -> tuple[
+    np.ndarray,
+    list[float],
+]:
     """
-    Exécute le benchmark d'une fonction de prédiction.
+    Exécute un benchmark observation par observation.
+
+    Le temps mesuré inclut :
+    - conversion pandas -> NumPy ;
+    - inférence ;
+    - extraction de la probabilité.
     """
     probabilities = []
     latencies = []
 
     for _, row in dataframe.iterrows():
-        start_time = time.perf_counter()
+        start_time = (
+            time.perf_counter()
+        )
 
-        probability = predict_function(
-            row
+        probability = (
+            predict_function(
+                row
+            )
         )
 
         latency_ms = (
@@ -348,14 +460,25 @@ def benchmark(
     )
 
 
+# -------------------------------------------------------------------
+# Statistiques
+# -------------------------------------------------------------------
+
 def summarize_latencies(
     latencies: list[float],
 ) -> dict:
     """
-    Résume les performances temporelles.
+    Calcule les principales statistiques
+    de latence du benchmark.
     """
+    if not latencies:
+        raise RuntimeError(
+            "Aucune latence disponible."
+        )
+
     series = pd.Series(
-        latencies
+        latencies,
+        dtype=float,
     )
 
     return {
@@ -368,15 +491,27 @@ def summarize_latencies(
             4,
         ),
         "p90_ms": round(
-            float(series.quantile(0.90)),
+            float(
+                series.quantile(
+                    0.90
+                )
+            ),
             4,
         ),
         "p95_ms": round(
-            float(series.quantile(0.95)),
+            float(
+                series.quantile(
+                    0.95
+                )
+            ),
             4,
         ),
         "p99_ms": round(
-            float(series.quantile(0.99)),
+            float(
+                series.quantile(
+                    0.99
+                )
+            ),
             4,
         ),
         "min_ms": round(
@@ -385,6 +520,10 @@ def summarize_latencies(
         ),
         "max_ms": round(
             float(series.max()),
+            4,
+        ),
+        "std_ms": round(
+            float(series.std()),
             4,
         ),
     }
@@ -396,8 +535,13 @@ def summarize_latencies(
 
 def main() -> None:
     print(
-        "\n=== BENCHMARK XGBOOST VS ONNX RUNTIME ===\n"
+        "\n=== BENCHMARK XGBOOST VS "
+        "ONNX RUNTIME MONO-THREAD ===\n"
     )
+
+    # ---------------------------------------------------------------
+    # Dataset
+    # ---------------------------------------------------------------
 
     dataframe = load_sample()
 
@@ -412,25 +556,34 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------------
-    # XGBoost
+    # XGBoost de référence
     # ---------------------------------------------------------------
 
-    model_service.load()
-
-    # ---------------------------------------------------------------
-    # ONNX
-    # ---------------------------------------------------------------
-
-    session = create_onnx_session()
-
-    inspect_onnx_outputs(
-        session
+    print(
+        "\nChargement du modèle "
+        "XGBoost de référence..."
     )
 
-    input_name = (
-        session
-        .get_inputs()[0]
-        .name
+    xgboost_booster = (
+        load_reference_xgboost()
+    )
+
+    print(
+        "Modèle XGBoost de référence chargé."
+    )
+
+    # ---------------------------------------------------------------
+    # ONNX de production
+    # ---------------------------------------------------------------
+
+    (
+        onnx_session,
+        input_name,
+        probabilities_output_name,
+    ) = get_production_onnx_session()
+
+    inspect_onnx_session(
+        onnx_session
     )
 
     # ---------------------------------------------------------------
@@ -438,7 +591,8 @@ def main() -> None:
     # ---------------------------------------------------------------
 
     print(
-        f"\nWarm-up : {WARMUP_RUNS} observations..."
+        f"\nWarm-up : "
+        f"{WARMUP_RUNS} observations..."
     )
 
     warmup_df = dataframe.head(
@@ -447,12 +601,14 @@ def main() -> None:
 
     for _, row in warmup_df.iterrows():
         predict_xgboost(
-            row
+            xgboost_booster,
+            row,
         )
 
         predict_onnx(
-            session,
+            onnx_session,
             input_name,
+            probabilities_output_name,
             row,
         )
 
@@ -468,9 +624,15 @@ def main() -> None:
         "\nBenchmark XGBoost..."
     )
 
-    xgb_probabilities, xgb_latencies = benchmark(
+    (
+        xgb_probabilities,
+        xgb_latencies,
+    ) = benchmark(
         dataframe,
-        predict_xgboost,
+        lambda row: predict_xgboost(
+            xgboost_booster,
+            row,
+        ),
     )
 
     # ---------------------------------------------------------------
@@ -478,17 +640,25 @@ def main() -> None:
     # ---------------------------------------------------------------
 
     print(
-        "Benchmark ONNX Runtime..."
+        "Benchmark ONNX Runtime mono-thread..."
     )
 
-    onnx_probabilities, onnx_latencies = benchmark(
+    (
+        onnx_probabilities,
+        onnx_latencies,
+    ) = benchmark(
         dataframe,
         lambda row: predict_onnx(
-            session,
+            onnx_session,
             input_name,
+            probabilities_output_name,
             row,
         ),
     )
+
+    # ---------------------------------------------------------------
+    # Résumés
+    # ---------------------------------------------------------------
 
     xgb_summary = summarize_latencies(
         xgb_latencies
@@ -499,7 +669,7 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------------
-    # Comparaison numérique
+    # Comparaison des probabilités
     # ---------------------------------------------------------------
 
     absolute_differences = np.abs(
@@ -525,19 +695,17 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------------
-    # Classes métier
+    # Comparaison des décisions métier
     # ---------------------------------------------------------------
-
-    threshold = 0.45
 
     xgb_predictions = (
         xgb_probabilities
-        >= threshold
+        >= DECISION_THRESHOLD
     ).astype(int)
 
     onnx_predictions = (
         onnx_probabilities
-        >= threshold
+        >= DECISION_THRESHOLD
     ).astype(int)
 
     predictions_identical = bool(
@@ -547,8 +715,15 @@ def main() -> None:
         )
     )
 
+    differing_predictions = int(
+        np.sum(
+            xgb_predictions
+            != onnx_predictions
+        )
+    )
+
     # ---------------------------------------------------------------
-    # Gain/perte
+    # Calcul du gain
     # ---------------------------------------------------------------
 
     xgb_mean = xgb_summary[
@@ -559,38 +734,58 @@ def main() -> None:
         "mean_ms"
     ]
 
-    onnx_speedup = (
-        xgb_mean / onnx_mean
-        if onnx_mean > 0
-        else 0.0
-    )
-
-    improvement_percentage = (
-        (
+    if onnx_mean > 0:
+        speedup = (
             xgb_mean
-            - onnx_mean
+            / onnx_mean
         )
-        / xgb_mean
-        * 100
-        if xgb_mean > 0
-        else 0.0
-    )
+    else:
+        speedup = 0.0
+
+    if xgb_mean > 0:
+        improvement_percentage = (
+            (
+                xgb_mean
+                - onnx_mean
+            )
+            / xgb_mean
+            * 100
+        )
+    else:
+        improvement_percentage = 0.0
 
     # ---------------------------------------------------------------
     # Rapport
     # ---------------------------------------------------------------
 
     report = {
-        "observations": len(
-            dataframe
+        "observations": int(
+            len(dataframe)
         ),
-        "features": len(
-            dataframe.columns
+        "features": int(
+            len(dataframe.columns)
         ),
-        "xgboost": xgb_summary,
-        "onnx_runtime": onnx_summary,
+        "decision_threshold": (
+            DECISION_THRESHOLD
+        ),
+        "xgboost_reference": (
+            xgb_summary
+        ),
+        "onnx_runtime_production": (
+            onnx_summary
+        ),
+        "onnx_configuration": {
+            "providers": (
+                onnx_session.get_providers()
+            ),
+            "execution_mode": (
+                "ORT_SEQUENTIAL"
+            ),
+            "intra_op_num_threads": 1,
+            "inter_op_num_threads": 1,
+        },
         "onnx_speedup_vs_xgboost": round(
-            onnx_speedup,
+            speedup,
             3,
         ),
         "improvement_percentage": round(
@@ -603,16 +798,14 @@ def main() -> None:
         "predictions_identical": (
             predictions_identical
         ),
+        "differing_predictions": (
+            differing_predictions
+        ),
         "max_probability_difference": (
             max_difference
         ),
         "mean_probability_difference": (
             mean_difference
-        ),
-        "decision_threshold": threshold,
-        "onnx_provider": (
-            session
-            .get_providers()
         ),
     }
 
@@ -629,7 +822,7 @@ def main() -> None:
         )
 
     # ---------------------------------------------------------------
-    # Affichage
+    # Affichage XGBoost
     # ---------------------------------------------------------------
 
     print(
@@ -643,8 +836,13 @@ def main() -> None:
         )
     )
 
+    # ---------------------------------------------------------------
+    # Affichage ONNX
+    # ---------------------------------------------------------------
+
     print(
-        "\n=== ONNX RUNTIME ===\n"
+        "\n=== ONNX RUNTIME "
+        "MONO-THREAD ===\n"
     )
 
     print(
@@ -653,6 +851,10 @@ def main() -> None:
             indent=4,
         )
     )
+
+    # ---------------------------------------------------------------
+    # Comparaison
+    # ---------------------------------------------------------------
 
     print(
         "\n=== COMPARAISON ===\n"
@@ -669,6 +871,11 @@ def main() -> None:
     )
 
     print(
+        "Prédictions différentes :",
+        differing_predictions,
+    )
+
+    print(
         "Différence maximale :",
         max_difference,
     )
@@ -680,12 +887,37 @@ def main() -> None:
 
     print(
         "Speedup ONNX vs XGBoost :",
-        f"x{onnx_speedup:.2f}",
+        f"x{speedup:.2f}",
     )
 
     print(
         "Amélioration moyenne :",
         f"{improvement_percentage:.2f} %",
+    )
+
+    # ---------------------------------------------------------------
+    # Configuration ONNX
+    # ---------------------------------------------------------------
+
+    print(
+        "\n=== CONFIGURATION ONNX ===\n"
+    )
+
+    print(
+        "Provider :",
+        onnx_session.get_providers(),
+    )
+
+    print(
+        "Execution mode : ORT_SEQUENTIAL"
+    )
+
+    print(
+        "Threads intra-op : 1"
+    )
+
+    print(
+        "Threads inter-op : 1"
     )
 
     print(

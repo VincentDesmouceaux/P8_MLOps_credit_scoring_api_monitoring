@@ -28,6 +28,9 @@ EXPECTED_FEATURE_COUNT = 656
 
 ONNX_PROVIDER = "CPUExecutionProvider"
 
+ONNX_INTRA_OP_THREADS = 1
+ONNX_INTER_OP_THREADS = 1
+
 
 # -------------------------------------------------------------------
 # Service modèle
@@ -38,8 +41,8 @@ class ModelService:
         """
         Initialise la configuration du service d'inférence.
 
-        Le modèle ONNX n'est pas chargé ici afin de conserver
-        un chargement explicite au démarrage de FastAPI.
+        Le modèle ONNX est chargé explicitement au démarrage
+        de FastAPI via la méthode load().
         """
         self.session: ort.InferenceSession | None = None
 
@@ -89,17 +92,19 @@ class ModelService:
                 "être des chaînes de caractères."
             )
 
-        if len(feature_names) != EXPECTED_FEATURE_COUNT:
+        if (
+            len(feature_names)
+            != EXPECTED_FEATURE_COUNT
+        ):
             raise RuntimeError(
                 "Le modèle P8 doit utiliser exactement "
                 f"{EXPECTED_FEATURE_COUNT} features. "
                 f"Reçu : {len(feature_names)}."
             )
 
-        if len(
-            set(feature_names)
-        ) != len(
-            feature_names
+        if (
+            len(set(feature_names))
+            != len(feature_names)
         ):
             raise RuntimeError(
                 "Des noms de features dupliqués "
@@ -118,9 +123,12 @@ class ModelService:
         """
         Charge le modèle ONNX une seule fois.
 
-        ONNX Runtime est configuré avec CPUExecutionProvider,
-        ce qui correspond à l'environnement de production Render
-        et à la configuration utilisée pendant les benchmarks.
+        ONNX Runtime est configuré en CPU mono-thread et
+        en exécution séquentielle.
+
+        Cette configuration est volontairement testée afin
+        de limiter l'overhead et la contention CPU observés
+        dans l'environnement Render lors des benchmarks HTTP.
         """
         if self.loaded:
             return
@@ -141,6 +149,18 @@ class ModelService:
 
         session_options = (
             ort.SessionOptions()
+        )
+
+        session_options.intra_op_num_threads = (
+            ONNX_INTRA_OP_THREADS
+        )
+
+        session_options.inter_op_num_threads = (
+            ONNX_INTER_OP_THREADS
+        )
+
+        session_options.execution_mode = (
+            ort.ExecutionMode.ORT_SEQUENTIAL
         )
 
         try:
@@ -166,7 +186,10 @@ class ModelService:
             session.get_providers()
         )
 
-        if ONNX_PROVIDER not in active_providers:
+        if (
+            ONNX_PROVIDER
+            not in active_providers
+        ):
             raise RuntimeError(
                 "Le provider ONNX Runtime attendu "
                 f"'{ONNX_PROVIDER}' n'est pas actif. "
@@ -225,7 +248,9 @@ class ModelService:
         # Recherche de la sortie probabilities
         # -----------------------------------------------------------
 
-        outputs = session.get_outputs()
+        outputs = (
+            session.get_outputs()
+        )
 
         probabilities_output = None
 
@@ -262,10 +287,11 @@ class ModelService:
             )
 
         # -----------------------------------------------------------
-        # Affectation uniquement après validation complète
+        # Affectation après validation complète
         # -----------------------------------------------------------
 
         self.session = session
+
         self.input_name = (
             input_info.name
         )
@@ -288,6 +314,20 @@ class ModelService:
         print(
             "Provider :",
             ONNX_PROVIDER,
+        )
+
+        print(
+            "Mode d'exécution : ORT_SEQUENTIAL"
+        )
+
+        print(
+            "Threads intra-op :",
+            ONNX_INTRA_OP_THREADS,
+        )
+
+        print(
+            "Threads inter-op :",
+            ONNX_INTER_OP_THREADS,
         )
 
         print(
@@ -359,7 +399,7 @@ class ModelService:
         JSON null -> Python None -> np.nan.
 
         L'entrée finale est un tableau NumPy float32
-        de shape (1, 656), format attendu par ONNX Runtime.
+        de shape (1, 656).
         """
         values = np.empty(
             EXPECTED_FEATURE_COUNT,
@@ -391,8 +431,8 @@ class ModelService:
                     f"la feature '{feature_name}'."
                 ) from error
 
-            # NaN est autorisé car il représente
-            # une valeur manquante du dataset P6.
+            # NaN représente une valeur manquante
+            # valide pour ce modèle.
             #
             # Les valeurs infinies sont interdites.
 
@@ -422,7 +462,10 @@ class ModelService:
                 "n'a pas la forme attendue."
             )
 
-        if input_array.dtype != np.float32:
+        if (
+            input_array.dtype
+            != np.float32
+        ):
             raise RuntimeError(
                 "Le tableau d'inférence doit "
                 "être en float32."
@@ -439,11 +482,8 @@ class ModelService:
         probabilities: np.ndarray,
     ) -> float:
         """
-        Extrait la probabilité de la classe positive
-        correspondant au défaut client.
-
-        Le modèle exporté fournit une matrice :
-        [[P(classe 0), P(classe 1)]].
+        Extrait la probabilité de défaut,
+        correspondant à la classe positive 1.
         """
         if not isinstance(
             probabilities,
@@ -500,16 +540,13 @@ class ModelService:
         """
         Retourne la probabilité de défaut du client.
 
-        Pipeline final optimisé :
+        Pipeline candidat optimisé :
 
         dict
           -> validation
           -> NumPy float32 (1, 656)
-          -> ONNX Runtime CPU
+          -> ONNX Runtime CPU mono-thread
           -> probabilité classe 1
-
-        Le contrat public predict_proba() reste identique
-        à celui des précédentes versions du service.
         """
         self.load()
 
