@@ -26,7 +26,7 @@ from app.services.model_service import model_service
 # -------------------------------------------------------------------
 
 API_TITLE = "P8 Credit Scoring API"
-API_VERSION = "0.5.0"
+API_VERSION = "0.6.0"
 API_SERVICE_NAME = "p8-credit-scoring-api"
 
 
@@ -37,13 +37,11 @@ API_SERVICE_NAME = "p8-credit-scoring-api"
 MODEL_NAME = "P6_credit_scoring_default_risk_model"
 MODEL_VERSION = "2"
 
-# Le modèle métier reste un XGBoost.
 MODEL_FAMILY = "XGBoost"
 
-# Runtime utilisé en production après optimisation.
-MODEL_RUNTIME = "ONNX Runtime"
-
-ONNX_PROVIDER = "CPUExecutionProvider"
+MODEL_RUNTIME = (
+    "XGBoost Booster.inplace_predict"
+)
 
 MLFLOW_ALIAS = "champion"
 
@@ -55,13 +53,15 @@ DECISION_THRESHOLD = 0.45
 # -------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(
+    app: FastAPI,
+):
     """
-    Charge la session ONNX Runtime une seule fois
+    Charge le modèle XGBoost une seule fois
     au démarrage de l'API.
 
-    Le modèle reste ensuite en mémoire et est réutilisé
-    pour toutes les requêtes de prédiction.
+    Le modèle et son Booster restent ensuite en mémoire
+    pour être réutilisés par toutes les prédictions.
     """
     model_service.load()
 
@@ -72,7 +72,8 @@ app = FastAPI(
     title=API_TITLE,
     description=(
         "API de mise en production du modèle de scoring crédit "
-        "issu du projet P6, optimisée avec ONNX Runtime."
+        "issu du projet P6, optimisée avec NumPy float32 et "
+        "XGBoost Booster.inplace_predict."
     ),
     version=API_VERSION,
     lifespan=lifespan,
@@ -101,16 +102,6 @@ def model_info() -> dict[str, Any]:
     Retourne les principales informations
     du modèle actuellement déployé.
     """
-    active_providers: list[str] = []
-
-    if (
-        model_service.loaded
-        and model_service.session is not None
-    ):
-        active_providers = (
-            model_service.session.get_providers()
-        )
-
     return {
         "model_name": MODEL_NAME,
         "model_version": int(
@@ -126,11 +117,7 @@ def model_info() -> dict[str, Any]:
         "loaded": model_service.loaded,
         "inference_pipeline": (
             "JSON features -> NumPy float32 -> "
-            "ONNX Runtime"
-        ),
-        "onnx_provider": ONNX_PROVIDER,
-        "active_onnx_providers": (
-            active_providers
+            "XGBoost Booster.inplace_predict"
         ),
         "monitoring_persistence": (
             "FastAPI BackgroundTasks + "
@@ -182,20 +169,22 @@ def write_structured_log(
     Écrit un événement JSON structuré
     dans les logs applicatifs.
 
-    Les 656 features complètes ne sont volontairement
-    pas écrites dans les logs Render.
+    Les 656 features complètes ne sont pas écrites
+    dans les logs Render.
 
     Elles sont persistées séparément dans
-    PostgreSQL/Supabase pour le monitoring et le Data Drift.
+    PostgreSQL/Supabase afin de permettre :
+    - le suivi opérationnel ;
+    - l'analyse de Data Drift ;
+    - la traçabilité des prédictions.
 
     Mesures principales :
     - latency_ms :
-      préparation de l'entrée + inférence ONNX ;
+      préparation des features + inférence XGBoost ;
     - handler_total_ms :
-      temps passé dans le handler avant génération
-      de la réponse ;
+      temps passé dans le handler avant la réponse ;
     - monitoring_storage_ms :
-      durée de la persistance Supabase exécutée
+      durée du stockage Supabase exécuté
       en arrière-plan.
     """
     log_entry: dict[str, Any] = {
@@ -285,8 +274,7 @@ def log_prediction_safely(
     dans PostgreSQL/Supabase.
 
     Cette fonction est exécutée via BackgroundTasks
-    afin de sortir le stockage PostgreSQL/Supabase
-    du chemin critique de la réponse HTTP.
+    afin que la persistance ne bloque pas la réponse HTTP.
 
     Retourne la durée du stockage en millisecondes.
     """
@@ -345,10 +333,10 @@ def persist_prediction_in_background(
 ) -> None:
     """
     Persiste les données de monitoring
-    après génération de la réponse HTTP.
+    après la génération de la réponse HTTP.
 
-    Le coût du stockage reste mesuré et tracé,
-    mais il ne bloque plus le client.
+    Le coût de PostgreSQL/Supabase reste mesuré
+    et apparaît dans un événement séparé.
     """
     monitoring_storage_ms = (
         log_prediction_safely(
@@ -392,14 +380,15 @@ def predict(
     """
     Calcule la probabilité de défaut d'un client.
 
-    Pipeline optimisé :
+    Pipeline final retenu :
     - génère un request_id ;
-    - valide et reconstruit les 656 features ;
-    - exécute l'inférence via ONNX Runtime ;
+    - valide les 656 features ;
+    - construit un tableau NumPy float32 ;
+    - exécute XGBoost Booster.inplace_predict ;
     - applique le seuil métier de 0.45 ;
-    - mesure la latence d'inférence ;
-    - planifie la persistance Supabase en arrière-plan ;
-    - retourne immédiatement la prédiction.
+    - mesure la latence ;
+    - planifie le stockage Supabase en arrière-plan ;
+    - retourne la prédiction sans attendre PostgreSQL.
     """
     request_id = uuid4()
 
@@ -413,7 +402,7 @@ def predict(
 
     try:
         # -----------------------------------------------------------
-        # Inférence ONNX Runtime
+        # Inférence optimisée XGBoost
         # -----------------------------------------------------------
 
         probability_default = float(
@@ -438,7 +427,7 @@ def predict(
         )
 
         # -----------------------------------------------------------
-        # Persistance monitoring en arrière-plan
+        # Monitoring en arrière-plan
         # -----------------------------------------------------------
 
         background_tasks.add_task(
@@ -489,7 +478,7 @@ def predict(
         )
 
     # ----------------------------------------------------------------
-    # Erreur métier / features invalides
+    # Features invalides / erreur métier
     # ----------------------------------------------------------------
 
     except ValueError as error:

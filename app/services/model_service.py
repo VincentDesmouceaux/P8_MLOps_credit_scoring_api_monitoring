@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
+from typing import Any
 
+import mlflow.xgboost
 import numpy as np
-import onnxruntime as ort
 
 
 # -------------------------------------------------------------------
@@ -11,11 +12,10 @@ import onnxruntime as ort
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ONNX_MODEL_PATH = (
+MODEL_PATH = (
     PROJECT_ROOT
     / "models"
-    / "onnx"
-    / "credit_scoring_model.onnx"
+    / "credit_scoring_model"
 )
 
 FEATURE_NAMES_PATH = (
@@ -26,11 +26,6 @@ FEATURE_NAMES_PATH = (
 
 EXPECTED_FEATURE_COUNT = 656
 
-ONNX_PROVIDER = "CPUExecutionProvider"
-
-ONNX_INTRA_OP_THREADS = 1
-ONNX_INTER_OP_THREADS = 1
-
 
 # -------------------------------------------------------------------
 # Service modèle
@@ -39,16 +34,13 @@ ONNX_INTER_OP_THREADS = 1
 class ModelService:
     def __init__(self) -> None:
         """
-        Initialise la configuration du service d'inférence.
+        Initialise le service d'inférence XGBoost.
 
-        Le modèle ONNX est chargé explicitement au démarrage
-        de FastAPI via la méthode load().
+        Le modèle n'est pas chargé immédiatement afin de conserver
+        un chargement explicite au démarrage de FastAPI.
         """
-        self.session: ort.InferenceSession | None = None
-
-        self.input_name: str | None = None
-        self.probabilities_output_name: str | None = None
-
+        self.model: Any | None = None
+        self.booster: Any | None = None
         self.loaded = False
 
         # -----------------------------------------------------------
@@ -92,19 +84,17 @@ class ModelService:
                 "être des chaînes de caractères."
             )
 
-        if (
-            len(feature_names)
-            != EXPECTED_FEATURE_COUNT
-        ):
+        if len(feature_names) != EXPECTED_FEATURE_COUNT:
             raise RuntimeError(
                 "Le modèle P8 doit utiliser exactement "
                 f"{EXPECTED_FEATURE_COUNT} features. "
                 f"Reçu : {len(feature_names)}."
             )
 
-        if (
-            len(set(feature_names))
-            != len(feature_names)
+        if len(
+            set(feature_names)
+        ) != len(
+            feature_names
         ):
             raise RuntimeError(
                 "Des noms de features dupliqués "
@@ -121,223 +111,72 @@ class ModelService:
 
     def load(self) -> None:
         """
-        Charge le modèle ONNX une seule fois.
+        Charge le modèle MLflow/XGBoost une seule fois.
 
-        ONNX Runtime est configuré en CPU mono-thread et
-        en exécution séquentielle.
+        Le Booster natif est extrait au démarrage afin d'utiliser
+        directement Booster.inplace_predict() pendant l'inférence.
 
-        Cette configuration est volontairement testée afin
-        de limiter l'overhead et la contention CPU observés
-        dans l'environnement Render lors des benchmarks HTTP.
+        Cette configuration a été retenue après comparaison avec
+        ONNX Runtime car elle offre le meilleur temps de réponse
+        HTTP dans l'environnement de production Render.
         """
         if self.loaded:
             return
 
-        if not ONNX_MODEL_PATH.exists():
+        if not MODEL_PATH.exists():
             raise FileNotFoundError(
-                "Artefact ONNX introuvable : "
-                f"{ONNX_MODEL_PATH}"
+                "Artefact modèle introuvable : "
+                f"{MODEL_PATH}"
             )
 
         print(
-            "Chargement du modèle ONNX..."
-        )
-
-        # -----------------------------------------------------------
-        # Configuration ONNX Runtime
-        # -----------------------------------------------------------
-
-        session_options = (
-            ort.SessionOptions()
-        )
-
-        session_options.intra_op_num_threads = (
-            ONNX_INTRA_OP_THREADS
-        )
-
-        session_options.inter_op_num_threads = (
-            ONNX_INTER_OP_THREADS
-        )
-
-        session_options.execution_mode = (
-            ort.ExecutionMode.ORT_SEQUENTIAL
+            "Chargement du modèle XGBoost..."
         )
 
         try:
-            session = ort.InferenceSession(
-                str(ONNX_MODEL_PATH),
-                sess_options=session_options,
-                providers=[
-                    ONNX_PROVIDER,
-                ],
+            model = mlflow.xgboost.load_model(
+                str(MODEL_PATH)
             )
 
         except Exception as error:
             raise RuntimeError(
                 "Impossible de charger le modèle "
-                "avec ONNX Runtime."
+                "MLflow/XGBoost."
             ) from error
 
-        # -----------------------------------------------------------
-        # Validation provider
-        # -----------------------------------------------------------
-
-        active_providers = (
-            session.get_providers()
-        )
-
-        if (
-            ONNX_PROVIDER
-            not in active_providers
-        ):
+        if model is None:
             raise RuntimeError(
-                "Le provider ONNX Runtime attendu "
-                f"'{ONNX_PROVIDER}' n'est pas actif. "
-                f"Providers disponibles : "
-                f"{active_providers}"
+                "Le chargement du modèle a échoué."
             )
 
-        # -----------------------------------------------------------
-        # Validation entrée ONNX
-        # -----------------------------------------------------------
+        try:
+            booster = model.get_booster()
 
-        inputs = session.get_inputs()
-
-        if len(inputs) != 1:
+        except AttributeError as error:
             raise RuntimeError(
-                "Le modèle ONNX doit exposer "
-                "exactement une entrée."
-            )
+                "Impossible d'extraire le Booster "
+                "XGBoost du modèle."
+            ) from error
 
-        input_info = inputs[0]
-
-        if input_info.type != "tensor(float)":
+        if booster is None:
             raise RuntimeError(
-                "Le modèle ONNX doit accepter "
-                "une entrée float32. "
-                f"Type reçu : {input_info.type}."
+                "Le Booster XGBoost "
+                "n'est pas disponible."
             )
 
-        input_shape = input_info.shape
-
-        if len(input_shape) != 2:
-            raise RuntimeError(
-                "L'entrée ONNX doit être "
-                "un tenseur à deux dimensions."
-            )
-
-        feature_dimension = (
-            input_shape[1]
-        )
-
-        if (
-            isinstance(
-                feature_dimension,
-                int,
-            )
-            and feature_dimension
-            != EXPECTED_FEATURE_COUNT
-        ):
-            raise RuntimeError(
-                "Le modèle ONNX n'attend pas "
-                f"{EXPECTED_FEATURE_COUNT} features. "
-                f"Shape reçue : {input_shape}."
-            )
-
-        # -----------------------------------------------------------
-        # Recherche de la sortie probabilities
-        # -----------------------------------------------------------
-
-        outputs = (
-            session.get_outputs()
-        )
-
-        probabilities_output = None
-
-        for output_info in outputs:
-            if (
-                output_info.name
-                == "probabilities"
-            ):
-                probabilities_output = (
-                    output_info
-                )
-                break
-
-        if probabilities_output is None:
-            for output_info in outputs:
-                output_shape = (
-                    output_info.shape
-                )
-
-                if (
-                    output_info.type
-                    == "tensor(float)"
-                    and len(output_shape) == 2
-                ):
-                    probabilities_output = (
-                        output_info
-                    )
-                    break
-
-        if probabilities_output is None:
-            raise RuntimeError(
-                "Impossible d'identifier la sortie "
-                "de probabilités du modèle ONNX."
-            )
-
-        # -----------------------------------------------------------
-        # Affectation après validation complète
-        # -----------------------------------------------------------
-
-        self.session = session
-
-        self.input_name = (
-            input_info.name
-        )
-
-        self.probabilities_output_name = (
-            probabilities_output.name
-        )
-
+        # Affectation seulement après validation complète.
+        self.model = model
+        self.booster = booster
         self.loaded = True
 
         print(
-            "Modèle ONNX chargé."
+            "Modèle XGBoost chargé."
         )
 
         print(
             "Pipeline d'inférence : "
-            "NumPy float32 + ONNX Runtime"
-        )
-
-        print(
-            "Provider :",
-            ONNX_PROVIDER,
-        )
-
-        print(
-            "Mode d'exécution : ORT_SEQUENTIAL"
-        )
-
-        print(
-            "Threads intra-op :",
-            ONNX_INTRA_OP_THREADS,
-        )
-
-        print(
-            "Threads inter-op :",
-            ONNX_INTER_OP_THREADS,
-        )
-
-        print(
-            "Entrée ONNX :",
-            self.input_name,
-        )
-
-        print(
-            "Sortie probabilités :",
-            self.probabilities_output_name,
+            "NumPy float32 + "
+            "XGBoost Booster.inplace_predict"
         )
 
         print(
@@ -357,31 +196,23 @@ class ModelService:
     ) -> dict[str, list[str]]:
         """
         Vérifie que le payload contient exactement
-        les 656 features attendues.
+        les 656 features attendues par le modèle.
         """
         missing_features = [
             feature_name
-            for feature_name
-            in self.feature_names
-            if feature_name
-            not in features
+            for feature_name in self.feature_names
+            if feature_name not in features
         ]
 
         extra_features = [
             feature_name
-            for feature_name
-            in features
-            if feature_name
-            not in self.feature_names
+            for feature_name in features
+            if feature_name not in self.feature_names
         ]
 
         return {
-            "missing_features": (
-                missing_features
-            ),
-            "extra_features": (
-                extra_features
-            ),
+            "missing_features": missing_features,
+            "extra_features": extra_features,
         }
 
     # ----------------------------------------------------------------
@@ -394,12 +225,14 @@ class ModelService:
     ) -> np.ndarray:
         """
         Reconstruit une observation dans l'ordre exact
-        des 656 features du modèle.
+        des 656 features utilisées lors de l'entraînement.
 
-        JSON null -> Python None -> np.nan.
+        Les valeurs JSON null deviennent None dans FastAPI,
+        puis np.nan afin de préserver les valeurs manquantes.
 
-        L'entrée finale est un tableau NumPy float32
-        de shape (1, 656).
+        L'utilisation directe de NumPy float32 évite la création
+        d'un DataFrame pandas à chaque requête, goulot
+        d'étranglement identifié lors du profiling cProfile.
         """
         values = np.empty(
             EXPECTED_FEATURE_COUNT,
@@ -431,11 +264,6 @@ class ModelService:
                     f"la feature '{feature_name}'."
                 ) from error
 
-            # NaN représente une valeur manquante
-            # valide pour ce modèle.
-            #
-            # Les valeurs infinies sont interdites.
-
             if np.isinf(
                 numeric_value
             ):
@@ -462,10 +290,7 @@ class ModelService:
                 "n'a pas la forme attendue."
             )
 
-        if (
-            input_array.dtype
-            != np.float32
-        ):
+        if input_array.dtype != np.float32:
             raise RuntimeError(
                 "Le tableau d'inférence doit "
                 "être en float32."
@@ -474,63 +299,7 @@ class ModelService:
         return input_array
 
     # ----------------------------------------------------------------
-    # Extraction de la probabilité
-    # ----------------------------------------------------------------
-
-    def extract_probability_default(
-        self,
-        probabilities: np.ndarray,
-    ) -> float:
-        """
-        Extrait la probabilité de défaut,
-        correspondant à la classe positive 1.
-        """
-        if not isinstance(
-            probabilities,
-            np.ndarray,
-        ):
-            raise RuntimeError(
-                "La sortie probabilities du modèle "
-                "ONNX n'est pas un tableau NumPy."
-            )
-
-        if probabilities.shape != (
-            1,
-            2,
-        ):
-            raise RuntimeError(
-                "Shape inattendue pour la sortie "
-                "probabilities : "
-                f"{probabilities.shape}."
-            )
-
-        probability_default = float(
-            probabilities[0][1]
-        )
-
-        if not np.isfinite(
-            probability_default
-        ):
-            raise RuntimeError(
-                "La probabilité retournée par "
-                "ONNX Runtime n'est pas finie."
-            )
-
-        if not (
-            0.0
-            <= probability_default
-            <= 1.0
-        ):
-            raise RuntimeError(
-                "La probabilité retournée par "
-                "le modèle n'est pas comprise "
-                "entre 0 et 1."
-            )
-
-        return probability_default
-
-    # ----------------------------------------------------------------
-    # Prédiction ONNX Runtime
+    # Prédiction
     # ----------------------------------------------------------------
 
     def predict_proba(
@@ -540,20 +309,18 @@ class ModelService:
         """
         Retourne la probabilité de défaut du client.
 
-        Pipeline candidat optimisé :
+        Pipeline final retenu en production :
 
         dict
           -> validation
           -> NumPy float32 (1, 656)
-          -> ONNX Runtime CPU mono-thread
-          -> probabilité classe 1
+          -> XGBoost Booster.inplace_predict()
+          -> probabilité de défaut
         """
         self.load()
 
-        validation = (
-            self.validate_features(
-                features
-            )
+        validation = self.validate_features(
+            features
         )
 
         missing_features = validation[
@@ -580,62 +347,59 @@ class ModelService:
                 f"{extra_features[:5]}"
             )
 
-        input_array = (
-            self.build_input_array(
-                features
-            )
+        input_array = self.build_input_array(
+            features
         )
 
-        if self.session is None:
+        if self.booster is None:
             raise RuntimeError(
-                "La session ONNX Runtime "
-                "n'est pas chargée."
-            )
-
-        if self.input_name is None:
-            raise RuntimeError(
-                "Le nom de l'entrée ONNX "
-                "n'est pas disponible."
-            )
-
-        if (
-            self.probabilities_output_name
-            is None
-        ):
-            raise RuntimeError(
-                "Le nom de la sortie probabilities "
-                "n'est pas disponible."
+                "Le Booster XGBoost "
+                "n'est pas chargé."
             )
 
         try:
-            outputs = self.session.run(
-                [
-                    self.probabilities_output_name,
-                ],
-                {
-                    self.input_name: (
-                        input_array
-                    ),
-                },
+            predictions = (
+                self.booster.inplace_predict(
+                    input_array
+                )
             )
 
         except Exception as error:
             raise RuntimeError(
                 "Erreur lors de l'inférence "
-                "ONNX Runtime."
+                "XGBoost."
             ) from error
 
-        if len(outputs) != 1:
+        if len(predictions) != 1:
             raise RuntimeError(
-                "Nombre de sorties ONNX "
-                "inattendu."
+                "Format inattendu retourné par "
+                "Booster.inplace_predict()."
             )
 
-        return (
-            self.extract_probability_default(
-                outputs[0]
-            )
+        probability_default = float(
+            predictions[0]
         )
+
+        if not np.isfinite(
+            probability_default
+        ):
+            raise RuntimeError(
+                "La probabilité retournée "
+                "par XGBoost n'est pas finie."
+            )
+
+        if not (
+            0.0
+            <= probability_default
+            <= 1.0
+        ):
+            raise RuntimeError(
+                "La probabilité retournée "
+                "par le modèle n'est pas comprise "
+                "entre 0 et 1."
+            )
+
+        return probability_default
 
 
 # -------------------------------------------------------------------
