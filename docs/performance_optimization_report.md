@@ -684,22 +684,41 @@ Rapport :
 
 #### Objectif
 
-Ce benchmark compare directement :
+Après l'optimisation du pipeline XGBoost avec NumPy `float32` et
+`Booster.inplace_predict`, une seconde stratégie d'optimisation a été
+expérimentée : l'utilisation d'ONNX Runtime.
 
-- le modèle XGBoost natif ;
-- le même modèle converti en ONNX et exécuté avec ONNX Runtime.
+L'objectif de cette expérimentation était de déterminer s'il était
+possible de réduire davantage le temps d'inférence pure, sans modifier
+les probabilités ni les décisions produites par le modèle de référence.
 
-Afin d'obtenir une comparaison cohérente avec l'environnement
-de production, ONNX Runtime est configuré en CPU et en mode
-mono-thread.
+ONNX Runtime a donc été évalué comme **runtime alternatif expérimental**.
+Cette expérimentation permet de mesurer son potentiel d'optimisation,
+mais ne signifie pas qu'ONNX a été retenu comme runtime final de
+production.
 
-Configuration utilisée :
+La configuration finale de production reste :
 
 ```text
-Provider        : CPUExecutionProvider
-Execution mode  : ORT_SEQUENTIAL
-Threads intra-op: 1
-Threads inter-op: 1
+JSON features
+    ↓
+NumPy float32
+    ↓
+XGBoost Booster.inplace_predict
+    ↓
+Probabilité de défaut
+```
+
+#### Configuration ONNX expérimentale
+
+Afin d'obtenir une comparaison reproductible et cohérente avec un
+environnement CPU, ONNX Runtime a été configuré de la manière suivante :
+
+```text
+Provider         : CPUExecutionProvider
+Execution mode   : ORT_SEQUENTIAL
+Threads intra-op : 1
+Threads inter-op : 1
 ```
 
 #### Exécution
@@ -712,9 +731,9 @@ uv run python -m scripts.benchmark_onnx_runtime
 
 Benchmark réalisé sur :
 
-- **500 observations** ;
-- **656 features** ;
-- **20 observations de warm-up**.
+- 500 observations ;
+- 656 features ;
+- 20 observations de warm-up.
 
 ##### XGBoost natif
 
@@ -750,11 +769,16 @@ Résultat global :
 - différence maximale : **3.2782554626464844e-07** ;
 - différence moyenne : **4.2557716369628904e-08**.
 
-Ces résultats montrent qu'ONNX Runtime réduit très fortement
-le coût d'inférence du modèle tout en conservant les décisions
-produites par le modèle XGBoost original.
+Cette expérimentation démontre qu'ONNX Runtime constitue une piste
+d'optimisation très performante pour l'inférence pure.
 
----
+Cependant, l'optimisation d'un système de production doit être évaluée
+sur l'ensemble du chemin de requête et pas uniquement sur quelques
+centièmes de milliseconde d'inférence.
+
+La configuration finale retenue en production reste donc le pipeline
+NumPy `float32` + XGBoost `Booster.inplace_predict`, tandis qu'ONNX
+Runtime est conservé comme expérimentation documentée et validée.
 
 ### 17.5 Validation métier ONNX
 
@@ -822,14 +846,18 @@ Rapport :
 
 #### Objectif
 
-La performance d'un modèle ne doit pas être évaluée uniquement
-sur sa latence.
+La performance d'un moteur d'inférence ne doit pas être évaluée
+uniquement à partir de sa latence.
 
-Une comparaison des ressources consommées a donc également été
-réalisée entre :
+Une expérimentation complémentaire a donc comparé la consommation
+de ressources de :
 
-- XGBoost avec `inplace_predict` ;
-- ONNX Runtime sur CPU.
+- XGBoost avec `Booster.inplace_predict` ;
+- ONNX Runtime avec `CPUExecutionProvider`.
+
+Cette comparaison permet d'évaluer ONNX comme stratégie
+d'optimisation potentielle et d'étudier l'intérêt éventuel
+d'une modification de la configuration hardware.
 
 #### Exécution
 
@@ -855,15 +883,25 @@ GPU utilisé :
 
 **False**
 
-Ces résultats justifient le choix d'une exécution CPU avec
-ONNX Runtime.
+Les résultats montrent qu'ONNX Runtime présente un excellent potentiel
+en termes de temps d'exécution et de consommation de ressources pour
+l'inférence pure.
 
-L'utilisation d'un GPU n'est pas nécessaire pour ce modèle tabulaire
-de petite taille. Elle augmenterait la complexité et le coût de
-l'infrastructure sans bénéfice démontré dans les expérimentations
-réalisées.
+Ils montrent également qu'un GPU n'est pas nécessaire pour ce modèle
+de scoring tabulaire de petite taille.
 
----
+Le déploiement CPU est donc conservé. L'ajout d'une infrastructure GPU
+augmenterait le coût et la complexité du déploiement sans bénéfice
+démontré pour ce cas d'usage.
+
+La configuration finale de production utilise ainsi :
+
+- une infrastructure CPU ;
+- des entrées NumPy `float32` ;
+- XGBoost `Booster.inplace_predict`.
+
+ONNX Runtime reste une stratégie d'optimisation expérimentale validée
+et documentée, mais n'est pas utilisé comme runtime final de l'API.
 
 ### 17.7 Benchmark end-to-end de l'API déployée
 
@@ -878,25 +916,49 @@ Rapport :
 #### Objectif
 
 Les benchmarks locaux du moteur d'inférence ne représentent qu'une
-partie des performances perçues par un utilisateur réel.
+partie des performances réellement perçues par un client.
 
-Un benchmark end-to-end est donc exécuté depuis un client local
+Un benchmark end-to-end a donc été exécuté depuis un client local
 vers l'API FastAPI réellement déployée sur Render.
 
-Le test inclut notamment :
+Contrairement au benchmark ONNX expérimental, cette mesure évalue
+la **configuration finale réellement utilisée en production**.
 
-- le réseau ;
+Le pipeline de production retenu est :
+
+```text
+Requête HTTP
+    ↓
+FastAPI
+    ↓
+Validation des 656 features
+    ↓
+NumPy float32
+    ↓
+XGBoost Booster.inplace_predict
+    ↓
+Application du seuil métier
+    ↓
+Sérialisation de la réponse
+    ↓
+Réponse HTTP
+```
+
+La persistance du monitoring PostgreSQL/Supabase est exécutée
+en arrière-plan afin de ne pas maintenir cette opération dans
+le chemin critique de la réponse HTTP.
+
+#### Le benchmark end-to-end inclut
+
+- le transport réseau entre le client et Render ;
 - FastAPI ;
 - l'authentification par clé API ;
 - la validation du payload ;
 - la reconstruction des 656 features ;
-- ONNX Runtime ;
+- XGBoost `Booster.inplace_predict` avec entrée NumPy `float32` ;
+- l'application du seuil métier ;
 - la sérialisation de la réponse ;
 - l'infrastructure Render.
-
-La persistance de monitoring PostgreSQL/Supabase est exécutée
-en arrière-plan afin de ne plus bloquer le chemin critique
-de la réponse HTTP.
 
 #### Exécution
 
@@ -928,16 +990,44 @@ Configuration du benchmark :
 | Maximum | 239.460 ms |
 
 Le benchmark démontre que l'API optimisée reste stable sur les
-100 requêtes exécutées et que le temps de réponse end-to-end est
-nettement supérieur au seul temps d'inférence.
+100 requêtes exécutées, avec un taux de succès de **100 %**.
 
-Cette différence montre également que, dans la configuration finale,
-**le moteur ML n'est plus le principal goulot d'étranglement**.
+Le benchmark final utilise le pipeline NumPy `float32` +
+XGBoost `Booster.inplace_predict` retenu pour la production.
 
-Avec une inférence ONNX de l'ordre de quelques centièmes de
-milliseconde en benchmark local et une réponse HTTP de l'ordre
-de 120 ms en moyenne sur Render, la majorité de la latence restante
-provient désormais des couches applicatives, réseau et infrastructure.
+Les expérimentations ONNX ont montré qu'il était possible de réduire
+davantage le temps d'inférence pure. Cependant, les mesures end-to-end
+montrent que le moteur d'inférence n'est plus le principal facteur
+limitant une fois le pipeline XGBoost optimisé.
+
+Avec un temps de réponse moyen de **120.320 ms** sur Render, la latence
+restante provient principalement des couches applicatives, du réseau
+et de l'infrastructure d'hébergement plutôt que du calcul du modèle.
+
+Cette observation est importante : une optimisation supplémentaire
+de quelques dixièmes ou centièmes de milliseconde sur le moteur
+d'inférence aurait désormais un impact limité sur la latence totale
+perçue par le client.
+
+La stratégie finale privilégie donc une configuration simple,
+compatible avec l'environnement de production et déjà fortement
+optimisée :
+
+```text
+CPU
++
+NumPy float32
++
+XGBoost Booster.inplace_predict
++
+FastAPI
++
+monitoring asynchrone / hors chemin critique
+```
+
+ONNX Runtime reste documenté comme une optimisation expérimentale
+performante et comme une piste possible d'évolution future si les
+contraintes de charge ou d'infrastructure venaient à évoluer.
 
 ---
 
@@ -1012,3 +1102,123 @@ La version optimisée peut donc être retenue pour la production :
 elle améliore fortement les performances d'inférence, conserve
 les résultats du modèle de référence et reste compatible avec
 l'environnement CPU utilisé pour le déploiement.
+
+### 17.9 Analyse de la pertinence de la quantification
+
+Script :
+
+`scripts/analyze_onnx_quantization.py`
+
+Rapport :
+
+`reports/onnx_quantization_analysis.json`
+
+#### Objectif
+
+Une stratégie supplémentaire d'optimisation étudiée concerne
+la quantification du modèle.
+
+La quantification INT8 est fréquemment utilisée pour réduire :
+
+- la taille des modèles ;
+- leur consommation mémoire ;
+- leur temps d'inférence ;
+- la charge CPU.
+
+Cependant, son intérêt dépend fortement de la structure du graphe
+du modèle.
+
+Avant d'appliquer une transformation de quantification, le graphe
+ONNX du modèle XGBoost a donc été inspecté afin de déterminer
+si celui-ci contient des opérateurs réellement compatibles avec
+les mécanismes classiques de quantification ONNX Runtime.
+
+#### Exécution
+
+```bash
+uv run python -m scripts.analyze_onnx_quantization
+```
+
+#### Structure du modèle analysé
+
+Le modèle ONNX possède une taille de :
+
+`0.371 MB`
+
+Le graphe ne contient qu'un seul noeud :
+
+```text
+TreeEnsembleClassifier : 1
+```
+
+Aucun opérateur matriciel classiquement ciblé par les outils
+de quantification ONNX Runtime n'a été détecté.
+
+En particulier, le graphe ne contient pas :
+
+```text
+MatMul
+Gemm
+Conv
+Attention
+LSTM
+GRU
+```
+
+Le modèle ne contient également aucun initializer :
+
+```text
+Initializers : 0
+```
+
+Cela signifie que le modèle ne stocke pas ses paramètres sous la
+forme de matrices de poids classiques qui pourraient être converties
+de `float32` vers `int8` avec les mécanismes standards de
+quantification.
+
+#### Diagnostic
+
+Résultats de l'analyse :
+
+| Élément | Résultat |
+|---|---|
+| Modèle basé sur des arbres | Oui |
+| `TreeEnsembleClassifier` détecté | Oui |
+| Opérateurs matriciels quantifiables | Aucun |
+| Initializers | 0 |
+| Candidat à une quantification INT8 standard | Non |
+
+Le modèle XGBoost exporté vers ONNX est représenté par un opérateur
+`TreeEnsembleClassifier`.
+
+La quantification INT8 classique proposée par ONNX Runtime cible
+principalement des opérations matricielles comme `MatMul`, `Gemm`
+ou `Conv`, fréquemment utilisées dans les réseaux de neurones.
+
+Ces opérateurs étant absents du graphe, une quantification INT8
+standard n'est pas une stratégie pertinente pour ce modèle.
+
+#### Décision
+
+La quantification n'est donc pas appliquée à la version de production.
+
+Cette décision ne repose pas sur une hypothèse mais sur l'analyse
+de la structure réelle du graphe ONNX.
+
+Les stratégies d'optimisation retenues ou évaluées sont finalement :
+
+| Stratégie | Résultat |
+|---|---|
+| Suppression de Pandas du chemin critique | Retenue |
+| NumPy `float32` | Retenue |
+| XGBoost `Booster.inplace_predict` | Retenue |
+| Monitoring avec `BackgroundTasks` | Retenue |
+| ONNX Runtime | Évalué, non retenu en production |
+| ONNX mono-thread | Évalué |
+| Quantification INT8 | Analysée, non applicable au graphe |
+| GPU | Non nécessaire |
+| CPU | Retenu |
+
+Cette analyse permet de justifier la configuration finale sans
+ajouter une transformation qui augmenterait la complexité du système
+sans bénéfice technique démontré.
