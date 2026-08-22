@@ -1,4 +1,4 @@
-name: CI/CD - Tests, Build Docker, Deploy Render et Smoke Test
+name: CI/CD - Tests, Coverage, Build Docker, Deploy Render et Smoke Test
 
 on:
   push:
@@ -11,12 +11,13 @@ on:
 
 
 jobs:
+
   # -----------------------------------------------------------------
-  # Tests
+  # Tests + Coverage
   # -----------------------------------------------------------------
 
   tests:
-    name: Tests Pytest
+    name: Tests Pytest et Coverage >= 80 %
     runs-on: ubuntu-latest
 
     steps:
@@ -34,8 +35,20 @@ jobs:
       - name: Installer les dependances
         run: uv sync --frozen
 
-      - name: Executer les tests
-        run: uv run pytest -v
+      - name: Executer les tests avec coverage
+        run: |
+          uv run pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Publier le rapport de coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
 
 
   # -----------------------------------------------------------------
@@ -111,7 +124,6 @@ jobs:
 
           echo "Configuration du smoke test disponible."
 
-
       - name: Attendre que l API Render soit disponible
         env:
           API_URL: ${{ secrets.API_URL }}
@@ -142,7 +154,6 @@ jobs:
             "dans le delai imparti."
 
           exit 1
-
 
       - name: Verifier model-info
         env:
