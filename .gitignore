@@ -26,3 +26,5 @@ reports/*.csv
 
 # OS
 .DS_Store
+.coverage
+htmlcov/
