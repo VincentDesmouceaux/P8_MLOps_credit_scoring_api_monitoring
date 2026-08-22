@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "evidently>=0.7.21",
     "fastapi>=0.141.1",
-    "mlflow==3.14.0",
+    "mlflow==3.15.0",
     "numpy==2.5.0",
     "onnx>=1.22.0",
     "onnxmltools>=1.16.0",
