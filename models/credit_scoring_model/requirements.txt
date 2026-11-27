@@ -1,5 +1,5 @@
 aiohappyeyeballs==2.6.2
-aiohttp==3.14.3
+aiohttp==3.14.4
 aiosignal==1.4.0
 alembic==1.18.4
 annotated-doc==0.0.4
@@ -89,7 +89,7 @@ markupsafe==3.0.3
 matplotlib-inline==0.2.2
 matplotlib==3.11.0
 missingno==0.5.2
-mistune==3.3.3
+mistune==3.3.4
 mlflow-skinny==3.14.0
 mlflow-tracing==3.14.0
 mlflow==3.17.2
